@@ -31,7 +31,8 @@ def drop_path(x, drop_prob: float = 0.0, training: bool = False):
     shape = (x.shape[0],) + (1,) * (
         x.ndim - 1
     )  # work with diff dim tensors, not just 2D ConvNets
-    random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
+    random_tensor = keep_prob + \
+        torch.rand(shape, dtype=x.dtype, device=x.device)
     random_tensor.floor_()  # binarize
     output = x.div(keep_prob) * random_tensor
     return output
@@ -137,7 +138,8 @@ class Block(nn.Module):
             attn_drop=attn_drop,
             proj_drop=drop,
         )
-        self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+        self.drop_path = DropPath(
+            drop_path) if drop_path > 0.0 else nn.Identity()
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = Mlp(
@@ -159,7 +161,7 @@ class Block(nn.Module):
 class PatchEmbed(nn.Module):
     """Image to Patch Embedding"""
 
-    def __init__(self, img_size=224, patch_size=16, in_chans=3, embed_dim=768):
+    def __init__(self, img_size=224, patch_size=16, in_chans=1, embed_dim=768):
         super().__init__()
         num_patches = (img_size // patch_size) * (img_size // patch_size)
         self.img_size = img_size
@@ -183,7 +185,7 @@ class VisionTransformer(nn.Module):
         self,
         img_size=[224],
         patch_size=16,
-        in_chans=3,
+        in_chans=1,
         num_classes=0,
         embed_dim=768,
         depth=12,
@@ -209,7 +211,8 @@ class VisionTransformer(nn.Module):
         num_patches = self.patch_embed.num_patches
 
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim))
+        self.pos_embed = nn.Parameter(
+            torch.zeros(1, num_patches + 1, embed_dim))
         self.pos_drop = nn.Dropout(p=drop_rate)
 
         dpr = [
@@ -235,7 +238,8 @@ class VisionTransformer(nn.Module):
 
         # Classifier head
         self.head = (
-            nn.Linear(embed_dim, num_classes) if num_classes > 0 else nn.Identity()
+            nn.Linear(
+                embed_dim, num_classes) if num_classes > 0 else nn.Identity()
         )
 
         trunc_normal_(self.pos_embed, std=0.02)

@@ -34,6 +34,9 @@ import utils
 import vision_transformer as vits
 from vision_transformer import DINOHead
 
+from maicara.data.chimec import ChiMECSSLDataset
+from maicara.data.constants import CHIMEC_MEAN, CHIMEC_STD
+
 torchvision_archs = sorted(
     name
     for name in torchvision_models.__dict__
@@ -51,9 +54,10 @@ def get_args_parser():
         "--arch",
         default="vit_small",
         type=str,
-        choices=["vit_tiny", "vit_small", "vit_base", "xcit", "deit_tiny", "deit_small"]
-        + torchvision_archs
-        + torch.hub.list("facebookresearch/xcit:main"),
+        choices=["vit_tiny", "vit_small", "vit_base",
+                 "xcit", "deit_tiny", "deit_small"]
+        + torchvision_archs,
+        # + torch.hub.list("facebookresearch/xcit:main"),
         help="""Name of architecture to train. For quick experiments with ViTs,
         we recommend using vit_tiny or vit_small.""",
     )
@@ -157,7 +161,7 @@ def get_args_parser():
         "--batch_size_per_gpu",
         default=64,
         type=int,
-        help="Per-GPU batch-size : number of distinct images loaded on one GPU.",
+        help="Per-GPU batch-size: number of distinct images loaded on one GPU.",
     )
     parser.add_argument(
         "--epochs", default=100, type=int, help="Number of epochs of training."
@@ -231,12 +235,6 @@ def get_args_parser():
 
     # Misc
     parser.add_argument(
-        "--data_path",
-        default="/path/to/imagenet/train/",
-        type=str,
-        help="Please specify path to the ImageNet training data.",
-    )
-    parser.add_argument(
         "--output_dir", default=".", type=str, help="Path to save logs and checkpoints."
     )
     parser.add_argument(
@@ -270,7 +268,8 @@ def train_dino(args):
     utils.fix_random_seeds(args.seed)
     print("git:\n  {}\n".format(utils.get_sha()))
     print(
-        "\n".join("%s: %s" % (k, str(v)) for k, v in sorted(dict(vars(args)).items()))
+        "\n".join("%s: %s" % (k, str(v))
+                  for k, v in sorted(dict(vars(args)).items()))
     )
     cudnn.benchmark = True
 
@@ -280,7 +279,8 @@ def train_dino(args):
         args.local_crops_scale,
         args.local_crops_number,
     )
-    dataset = datasets.ImageFolder(args.data_path, transform=transform)
+    # TODO do not hardcode
+    dataset = ChiMECSSLDataset(transform, image_size=224, prescale=1.0)
     sampler = torch.utils.data.DistributedSampler(dataset, shuffle=True)
     data_loader = torch.utils.data.DataLoader(
         dataset,
@@ -345,12 +345,14 @@ def train_dino(args):
         teacher = nn.SyncBatchNorm.convert_sync_batchnorm(teacher)
 
         # we need DDP wrapper to have synchro batch norms working...
-        teacher = nn.parallel.DistributedDataParallel(teacher, device_ids=[args.gpu])
+        teacher = nn.parallel.DistributedDataParallel(
+            teacher, device_ids=[args.gpu])
         teacher_without_ddp = teacher.module
     else:
         # teacher_without_ddp and teacher are the same thing
         teacher_without_ddp = teacher
-    student = nn.parallel.DistributedDataParallel(student, device_ids=[args.gpu])
+    student = nn.parallel.DistributedDataParallel(
+        student, device_ids=[args.gpu])
     # teacher and student start with the same weights
     teacher_without_ddp.load_state_dict(student.module.state_dict())
     # there is no backpropagation through the teacher, so no need for gradients
@@ -378,7 +380,8 @@ def train_dino(args):
             params_groups, lr=0, momentum=0.9
         )  # lr is set by scheduler
     elif args.optimizer == "lars":
-        optimizer = utils.LARS(params_groups)  # to use with convnet and large batches
+        # to use with convnet and large batches
+        optimizer = utils.LARS(params_groups)
     # for mixed precision training
     fp16_scaler = None
     if args.use_fp16:
@@ -420,7 +423,7 @@ def train_dino(args):
     start_epoch = to_restore["epoch"]
 
     start_time = time.time()
-    print("Starting DINO training !")
+    print("Starting DINO training!")
     for epoch in range(start_epoch, args.epochs):
         data_loader.sampler.set_epoch(epoch)
 
@@ -451,10 +454,12 @@ def train_dino(args):
         }
         if fp16_scaler is not None:
             save_dict["fp16_scaler"] = fp16_scaler.state_dict()
-        utils.save_on_master(save_dict, os.path.join(args.output_dir, "checkpoint.pth"))
+        utils.save_on_master(save_dict, os.path.join(
+            args.output_dir, "checkpoint.pth"))
         if args.saveckp_freq and epoch % args.saveckp_freq == 0:
             utils.save_on_master(
-                save_dict, os.path.join(args.output_dir, f"checkpoint{epoch:04}.pth")
+                save_dict, os.path.join(
+                    args.output_dir, f"checkpoint{epoch:04}.pth")
             )
         log_stats = {
             **{f"train_{k}": v for k, v in train_stats.items()},
@@ -484,7 +489,7 @@ def train_one_epoch(
 ):
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = "Epoch: [{}/{}]".format(epoch, args.epochs)
-    for it, (images, _) in enumerate(metric_logger.log_every(data_loader, 10, header)):
+    for it, images in enumerate(metric_logger.log_every(data_loader, 10, header)):
         # update weight decay and learning rate according to their schedule
         it = len(data_loader) * epoch + it  # global training iteration
         for i, param_group in enumerate(optimizer.param_groups):
@@ -508,12 +513,12 @@ def train_one_epoch(
 
         # student update
         optimizer.zero_grad()
-        param_norms = None
         if fp16_scaler is None:
             loss.backward()
             if args.clip_grad:
                 param_norms = utils.clip_gradients(student, args.clip_grad)
-            utils.cancel_gradients_last_layer(epoch, student, args.freeze_last_layer)
+            utils.cancel_gradients_last_layer(
+                epoch, student, args.freeze_last_layer)
             optimizer.step()
         else:
             fp16_scaler.scale(loss).backward()
@@ -522,7 +527,8 @@ def train_one_epoch(
                     optimizer
                 )  # unscale the gradients of optimizer's assigned params in-place
                 param_norms = utils.clip_gradients(student, args.clip_grad)
-            utils.cancel_gradients_last_layer(epoch, student, args.freeze_last_layer)
+            utils.cancel_gradients_last_layer(
+                epoch, student, args.freeze_last_layer)
             fp16_scaler.step(optimizer)
             fp16_scaler.update()
 
@@ -592,7 +598,8 @@ class DINOLoss(nn.Module):
                 if v == iq:
                     # we skip cases where student and teacher operate on the same view
                     continue
-                loss = torch.sum(-q * F.log_softmax(student_out[v], dim=-1), dim=-1)
+                loss = torch.sum(-q *
+                                 F.log_softmax(student_out[v], dim=-1), dim=-1)
                 total_loss += loss.mean()
                 n_loss_terms += 1
         total_loss /= n_loss_terms
@@ -606,7 +613,8 @@ class DINOLoss(nn.Module):
         """
         batch_center = torch.sum(teacher_output, dim=0, keepdim=True)
         dist.all_reduce(batch_center)
-        batch_center = batch_center / (len(teacher_output) * dist.get_world_size())
+        batch_center = batch_center / \
+            (len(teacher_output) * dist.get_world_size())
 
         # ema update
         self.center = self.center * self.center_momentum + batch_center * (
@@ -627,13 +635,13 @@ class DataAugmentationDINO(object):
                     ],
                     p=0.8,
                 ),
-                transforms.RandomGrayscale(p=0.2),
+                # transforms.RandomGrayscale(p=0.2),
             ]
         )
         normalize = transforms.Compose(
             [
                 transforms.ToTensor(),
-                transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+                transforms.Normalize(CHIMEC_MEAN, CHIMEC_STD),
             ]
         )
 
