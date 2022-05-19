@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import argparse
+import torch.multiprocessing as mp
 import os
 import sys
 import datetime
@@ -19,6 +20,7 @@ import time
 import math
 import json
 from pathlib import Path
+import logging
 
 import numpy as np
 from PIL import Image
@@ -34,8 +36,9 @@ import utils
 import vision_transformer as vits
 from vision_transformer import DINOHead
 
-from maicara.data.chimec import ChiMECSSLDataset
+from chimec import ChiMECSSLDataset
 from maicara.data.constants import CHIMEC_MEAN, CHIMEC_STD
+from maicara.preprocessing.utils import log_code_state
 
 torchvision_archs = sorted(
     name
@@ -54,8 +57,7 @@ def get_args_parser():
         "--arch",
         default="vit_small",
         type=str,
-        choices=["vit_tiny", "vit_small", "vit_base",
-                 "xcit", "deit_tiny", "deit_small"]
+        choices=["vit_tiny", "vit_small", "vit_base", "xcit", "deit_tiny", "deit_small"]
         + torchvision_archs,
         # + torch.hub.list("facebookresearch/xcit:main"),
         help="""Name of architecture to train. For quick experiments with ViTs,
@@ -164,7 +166,7 @@ def get_args_parser():
         help="Per-GPU batch-size: number of distinct images loaded on one GPU.",
     )
     parser.add_argument(
-        "--epochs", default=100, type=int, help="Number of epochs of training."
+        "--epochs", default=800, type=int, help="Number of epochs of training."
     )
     parser.add_argument(
         "--freeze_last_layer",
@@ -238,12 +240,12 @@ def get_args_parser():
         "--output_dir", default=".", type=str, help="Path to save logs and checkpoints."
     )
     parser.add_argument(
-        "--saveckp_freq", default=20, type=int, help="Save checkpoint every x epochs."
+        "--saveckp_freq", default=100, type=int, help="Save checkpoint every x epochs."
     )
-    parser.add_argument("--seed", default=0, type=int, help="Random seed.")
+    parser.add_argument("--seed", default=None, type=int, help="Random seed.")
     parser.add_argument(
         "--num_workers",
-        default=10,
+        default=5,
         type=int,
         help="Number of data loading workers per GPU.",
     )
@@ -260,18 +262,45 @@ def get_args_parser():
         type=int,
         help="Please ignore and do not set this argument.",
     )
+    parser.add_argument(
+        "--world_size", default=None, type=int, help="number of distributed processes"
+    )
+    parser.add_argument(
+        "--devices",
+        type=str,
+        nargs="+",
+        default=None,
+        help="which devices to use on local machine",
+    )
     return parser
 
 
-def train_dino(args):
+def train_dino(gpu, args):
+    args.gpu = gpu
+    args.rank = gpu
     utils.init_distributed_mode(args)
+    if args.seed is None:
+        args.seed = torch.randint(0, 100000, (1,)).item()
     utils.fix_random_seeds(args.seed)
-    print("git:\n  {}\n".format(utils.get_sha()))
-    print(
-        "\n".join("%s: %s" % (k, str(v))
-                  for k, v in sorted(dict(vars(args)).items()))
-    )
     cudnn.benchmark = True
+
+    logging.basicConfig(
+        format="%(asctime)s|%(levelname)s|%(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    logger = logging.getLogger()
+    fh = logging.FileHandler(os.path.join(args.output_dir, "pretrain.log"))
+    if args.rank == 0:
+        logger.setLevel(logging.INFO)
+        log_code_state(args.output_dir)
+    else:
+        logger.setLevel(logging.ERROR)
+    logger.addHandler(fh)
+
+    logger.info("git:\n  {}\n".format(utils.get_sha()))
+    logger.info(
+        "\n".join("%s: %s" % (k, str(v)) for k, v in sorted(dict(vars(args)).items()))
+    )
 
     # ============ preparing data ... ============
     transform = DataAugmentationDINO(
@@ -290,7 +319,7 @@ def train_dino(args):
         pin_memory=True,
         drop_last=True,
     )
-    print(f"Data loaded: there are {len(dataset)} images.")
+    logger.info(f"Data loaded: there are {len(dataset)} images.")
 
     # ============ building student and teacher networks ... ============
     # we changed the name DeiT-S for ViT-S to avoid confusions
@@ -321,7 +350,7 @@ def train_dino(args):
         teacher = torchvision_models.__dict__[args.arch]()
         embed_dim = student.fc.weight.shape[1]
     else:
-        print(f"Unknow architecture: {args.arch}")
+        logger.error(f"Unknow architecture: {args.arch}")
 
     # multi-crop wrapper handles forward with inputs of different resolutions
     student = utils.MultiCropWrapper(
@@ -345,20 +374,18 @@ def train_dino(args):
         teacher = nn.SyncBatchNorm.convert_sync_batchnorm(teacher)
 
         # we need DDP wrapper to have synchro batch norms working...
-        teacher = nn.parallel.DistributedDataParallel(
-            teacher, device_ids=[args.gpu])
+        teacher = nn.parallel.DistributedDataParallel(teacher, device_ids=[args.gpu])
         teacher_without_ddp = teacher.module
     else:
         # teacher_without_ddp and teacher are the same thing
         teacher_without_ddp = teacher
-    student = nn.parallel.DistributedDataParallel(
-        student, device_ids=[args.gpu])
+    student = nn.parallel.DistributedDataParallel(student, device_ids=[args.gpu])
     # teacher and student start with the same weights
     teacher_without_ddp.load_state_dict(student.module.state_dict())
     # there is no backpropagation through the teacher, so no need for gradients
     for p in teacher.parameters():
         p.requires_grad = False
-    print(f"Student and Teacher are built: they are both {args.arch} network.")
+    logger.info(f"Student and Teacher are built: they are both {args.arch} network.")
 
     # ============ preparing loss ... ============
     dino_loss = DINOLoss(
@@ -407,7 +434,7 @@ def train_dino(args):
     momentum_schedule = utils.cosine_scheduler(
         args.momentum_teacher, 1, args.epochs, len(data_loader)
     )
-    print(f"Loss, optimizer and schedulers ready.")
+    logger.info(f"Loss, optimizer and schedulers ready.")
 
     # ============ optionally resume training ... ============
     to_restore = {"epoch": 0}
@@ -423,7 +450,7 @@ def train_dino(args):
     start_epoch = to_restore["epoch"]
 
     start_time = time.time()
-    print("Starting DINO training!")
+    logger.info("Starting DINO training!")
     for epoch in range(start_epoch, args.epochs):
         data_loader.sampler.set_epoch(epoch)
 
@@ -441,6 +468,7 @@ def train_dino(args):
             epoch,
             fp16_scaler,
             args,
+            logger,
         )
 
         # ============ writing logs ... ============
@@ -454,12 +482,10 @@ def train_dino(args):
         }
         if fp16_scaler is not None:
             save_dict["fp16_scaler"] = fp16_scaler.state_dict()
-        utils.save_on_master(save_dict, os.path.join(
-            args.output_dir, "checkpoint.pth"))
+        utils.save_on_master(save_dict, os.path.join(args.output_dir, "checkpoint.pth"))
         if args.saveckp_freq and epoch % args.saveckp_freq == 0:
             utils.save_on_master(
-                save_dict, os.path.join(
-                    args.output_dir, f"checkpoint{epoch:04}.pth")
+                save_dict, os.path.join(args.output_dir, f"checkpoint{epoch:04}.pth")
             )
         log_stats = {
             **{f"train_{k}": v for k, v in train_stats.items()},
@@ -470,7 +496,7 @@ def train_dino(args):
                 f.write(json.dumps(log_stats) + "\n")
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-    print("Training time {}".format(total_time_str))
+    logger.info("Training time {}".format(total_time_str))
 
 
 def train_one_epoch(
@@ -486,6 +512,7 @@ def train_one_epoch(
     epoch,
     fp16_scaler,
     args,
+    logger,
 ):
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = "Epoch: [{}/{}]".format(epoch, args.epochs)
@@ -508,7 +535,7 @@ def train_one_epoch(
             loss = dino_loss(student_output, teacher_output, epoch)
 
         if not math.isfinite(loss.item()):
-            print("Loss is {}, stopping training".format(loss.item()), force=True)
+            logger.info("Loss is {}, stopping training".format(loss.item()), force=True)
             sys.exit(1)
 
         # student update
@@ -517,8 +544,7 @@ def train_one_epoch(
             loss.backward()
             if args.clip_grad:
                 param_norms = utils.clip_gradients(student, args.clip_grad)
-            utils.cancel_gradients_last_layer(
-                epoch, student, args.freeze_last_layer)
+            utils.cancel_gradients_last_layer(epoch, student, args.freeze_last_layer)
             optimizer.step()
         else:
             fp16_scaler.scale(loss).backward()
@@ -527,8 +553,7 @@ def train_one_epoch(
                     optimizer
                 )  # unscale the gradients of optimizer's assigned params in-place
                 param_norms = utils.clip_gradients(student, args.clip_grad)
-            utils.cancel_gradients_last_layer(
-                epoch, student, args.freeze_last_layer)
+            utils.cancel_gradients_last_layer(epoch, student, args.freeze_last_layer)
             fp16_scaler.step(optimizer)
             fp16_scaler.update()
 
@@ -547,7 +572,7 @@ def train_one_epoch(
         metric_logger.update(wd=optimizer.param_groups[0]["weight_decay"])
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
-    print("Averaged stats:", metric_logger)
+    logger.info("Averaged stats: %s", metric_logger)
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
 
@@ -598,8 +623,7 @@ class DINOLoss(nn.Module):
                 if v == iq:
                     # we skip cases where student and teacher operate on the same view
                     continue
-                loss = torch.sum(-q *
-                                 F.log_softmax(student_out[v], dim=-1), dim=-1)
+                loss = torch.sum(-q * F.log_softmax(student_out[v], dim=-1), dim=-1)
                 total_loss += loss.mean()
                 n_loss_terms += 1
         total_loss /= n_loss_terms
@@ -613,8 +637,7 @@ class DINOLoss(nn.Module):
         """
         batch_center = torch.sum(teacher_output, dim=0, keepdim=True)
         dist.all_reduce(batch_center)
-        batch_center = batch_center / \
-            (len(teacher_output) * dist.get_world_size())
+        batch_center = batch_center / (len(teacher_output) * dist.get_world_size())
 
         # ema update
         self.center = self.center * self.center_momentum + batch_center * (
@@ -693,5 +716,14 @@ class DataAugmentationDINO(object):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser("DINO", parents=[get_args_parser()])
     args = parser.parse_args()
+    if args.devices is None:
+        args.devices = [f"{i}" for i in range(torch.cuda.device_count())]
+    if args.world_size is None:
+        args.world_size = len(args.devices)
+    args.port = str(utils.get_unused_local_port())
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
-    train_dino(args)
+    mp.spawn(
+        train_dino,
+        nprocs=len(args.devices),
+        args=(args,),
+    )

@@ -25,12 +25,17 @@ import random
 import datetime
 import subprocess
 from collections import defaultdict, deque
+import socket
+
+import logging
 
 import numpy as np
 import torch
 from torch import nn
 import torch.distributed as dist
 from PIL import ImageFilter, ImageOps
+
+logger = logging.getLogger()
 
 
 class GaussianBlur(object):
@@ -70,26 +75,39 @@ class Solarization(object):
             return img
 
 
+def get_unused_local_port():
+    """
+    Borrowed from: https://github.com/Valloric/YouCompleteMe
+    """
+    sock = socket.socket()
+    # This tells the OS to give us any free port in the range [1024 - 65535]
+    sock.bind(("", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+
+    return port
+
+
 def load_pretrained_weights(
     model, pretrained_weights, checkpoint_key, model_name, patch_size
 ):
     if os.path.isfile(pretrained_weights):
         state_dict = torch.load(pretrained_weights, map_location="cpu")
         if checkpoint_key is not None and checkpoint_key in state_dict:
-            print(f"Take key {checkpoint_key} in provided checkpoint dict")
+            logger.info(f"Take key {checkpoint_key} in provided checkpoint dict")
             state_dict = state_dict[checkpoint_key]
         # remove `module.` prefix
         state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
         # remove `backbone.` prefix induced by multicrop wrapper
         state_dict = {k.replace("backbone.", ""): v for k, v in state_dict.items()}
         msg = model.load_state_dict(state_dict, strict=False)
-        print(
+        logger.info(
             "Pretrained weights found at {} and loaded with msg: {}".format(
                 pretrained_weights, msg
             )
         )
     else:
-        print(
+        logger.info(
             "Please use the `--pretrained_weights` argument to indicate the path of the checkpoint to evaluate."
         )
         url = None
@@ -114,7 +132,7 @@ def load_pretrained_weights(
         elif model_name == "resnet50":
             url = "dino_resnet50_pretrain/dino_resnet50_pretrain.pth"
         if url is not None:
-            print(
+            logger.info(
                 "Since no pretrained weights have been provided, we load the reference pretrained DINO weights."
             )
             state_dict = torch.hub.load_state_dict_from_url(
@@ -122,7 +140,7 @@ def load_pretrained_weights(
             )
             model.load_state_dict(state_dict, strict=True)
         else:
-            print(
+            logger.info(
                 "There is no reference weights available for this model => We use random weights."
             )
 
@@ -140,13 +158,13 @@ def load_pretrained_linear_weights(linear_classifier, model_name, patch_size):
     elif model_name == "resnet50":
         url = "dino_resnet50_pretrain/dino_resnet50_linearweights.pth"
     if url is not None:
-        print("We load the reference pretrained linear weights.")
+        logger.info("We load the reference pretrained linear weights.")
         state_dict = torch.hub.load_state_dict_from_url(
             url="https://dl.fbaipublicfiles.com/dino/" + url
         )["state_dict"]
         linear_classifier.load_state_dict(state_dict, strict=True)
     else:
-        print("We use random linear weights.")
+        logger.info("We use random linear weights.")
 
 
 def clip_gradients(model, clip):
@@ -169,13 +187,13 @@ def cancel_gradients_last_layer(epoch, model, freeze_last_layer):
             p.grad = None
 
 
-def restart_from_checkpoint(ckp_path, run_variables=None, **kwargs):
+def restart_from_checkpoint(ckp_path, restore_objects=None, **kwargs):
     """
     Re-start from checkpoint
     """
     if not os.path.isfile(ckp_path):
         return
-    print("Found checkpoint at {}".format(ckp_path))
+    logger.info("Found checkpoint at {}".format(ckp_path))
 
     # open checkpoint file
     checkpoint = torch.load(ckp_path, map_location="cpu")
@@ -187,7 +205,7 @@ def restart_from_checkpoint(ckp_path, run_variables=None, **kwargs):
         if key in checkpoint and value is not None:
             try:
                 msg = value.load_state_dict(checkpoint[key], strict=False)
-                print(
+                logger.info(
                     "=> loaded '{}' from checkpoint '{}' with msg {}".format(
                         key, ckp_path, msg
                     )
@@ -195,21 +213,25 @@ def restart_from_checkpoint(ckp_path, run_variables=None, **kwargs):
             except TypeError:
                 try:
                     msg = value.load_state_dict(checkpoint[key])
-                    print("=> loaded '{}' from checkpoint: '{}'".format(key, ckp_path))
+                    logger.info(
+                        "=> loaded '{}' from checkpoint: '{}'".format(key, ckp_path)
+                    )
                 except ValueError:
-                    print(
+                    logger.warn(
                         "=> failed to load '{}' from checkpoint: '{}'".format(
                             key, ckp_path
                         )
                     )
         else:
-            print("=> key '{}' not found in checkpoint: '{}'".format(key, ckp_path))
+            logger.info(
+                "=> key '{}' not found in checkpoint: '{}'".format(key, ckp_path)
+            )
 
     # re load variable important for the run
-    if run_variables is not None:
-        for var_name in run_variables:
+    if restore_objects is not None:
+        for var_name in restore_objects:
             if var_name in checkpoint:
-                run_variables[var_name] = checkpoint[var_name]
+                restore_objects[var_name] = checkpoint[var_name]
 
 
 def cosine_scheduler(
@@ -260,7 +282,7 @@ class SmoothedValue(object):
 
     def __init__(self, window_size=20, fmt=None):
         if fmt is None:
-            fmt = "{median:.6f} ({global_avg:.6f})"
+            fmt = "{median:.3f} ({global_avg:.3f})"
         self.deque = deque(maxlen=window_size)
         self.total = 0.0
         self.count = 0
@@ -281,7 +303,7 @@ class SmoothedValue(object):
         dist.barrier()
         dist.all_reduce(t)
         t = t.tolist()
-        self.count = int(t[0])
+        self.count = max(int(t[0]), 1)
         self.total = t[1]
 
     @property
@@ -300,7 +322,10 @@ class SmoothedValue(object):
 
     @property
     def max(self):
-        return max(self.deque)
+        try:
+            return max(self.deque)
+        except ValueError:
+            return 1
 
     @property
     def value(self):
@@ -383,8 +408,8 @@ class MetricLogger(object):
             header = ""
         start_time = time.time()
         end = time.time()
-        iter_time = SmoothedValue(fmt="{avg:.6f}")
-        data_time = SmoothedValue(fmt="{avg:.6f}")
+        iter_time = SmoothedValue(fmt="{avg:.1f}")
+        data_time = SmoothedValue(fmt="{avg:.1f}")
         space_fmt = ":" + str(len(str(len(iterable)))) + "d"
         if torch.cuda.is_available():
             log_msg = self.delimiter.join(
@@ -418,7 +443,7 @@ class MetricLogger(object):
                 eta_seconds = iter_time.global_avg * (len(iterable) - i)
                 eta_string = str(datetime.timedelta(seconds=int(eta_seconds)))
                 if torch.cuda.is_available():
-                    print(
+                    logger.info(
                         log_msg.format(
                             i,
                             len(iterable),
@@ -430,7 +455,7 @@ class MetricLogger(object):
                         )
                     )
                 else:
-                    print(
+                    logger.info(
                         log_msg.format(
                             i,
                             len(iterable),
@@ -444,9 +469,9 @@ class MetricLogger(object):
             end = time.time()
         total_time = time.time() - start_time
         total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-        print(
+        logger.info(
             "{} Total time: {} ({:.6f} s / it)".format(
-                header, total_time_str, total_time / len(iterable)
+                header, total_time_str, total_time / max(len(iterable), 1)
             )
         )
 
@@ -501,6 +526,23 @@ def save_on_master(*args, **kwargs):
         torch.save(*args, **kwargs)
 
 
+def setup_logging(rank, output_dir, tag):
+    logging.basicConfig(
+        format="%(asctime)s|%(levelname)s|%(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    logger = logging.getLogger()
+    fh = logging.FileHandler(os.path.join(output_dir, tag + ".log"))
+
+    if rank == 0:
+        logger.setLevel(logging.INFO)
+    else:
+        logger.setLevel(logging.ERROR)
+    logger.addHandler(fh)
+
+    return logger
+
+
 def setup_for_distributed(is_master):
     """
     This function disables printing when not in master process
@@ -530,10 +572,8 @@ def init_distributed_mode(args):
     # launched naively with `python main_dino.py`
     # we manually add MASTER_ADDR and MASTER_PORT to env variables
     elif torch.cuda.is_available():
-        print("Will run the code on one GPU.")
-        args.rank, args.gpu, args.world_size = 0, 0, 1
         os.environ["MASTER_ADDR"] = "127.0.0.1"
-        os.environ["MASTER_PORT"] = "29500"
+        os.environ["MASTER_PORT"] = str(args.port)
     else:
         print("Does not support training without GPU.")
         sys.exit(1)

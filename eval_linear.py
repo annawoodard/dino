@@ -14,6 +14,7 @@
 import os
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import torch
@@ -32,20 +33,23 @@ def eval_linear(args):
     utils.init_distributed_mode(args)
     print("git:\n  {}\n".format(utils.get_sha()))
     print(
-        "\n".join("%s: %s" % (k, str(v)) for k, v in sorted(dict(vars(args)).items()))
+        "\n".join("%s: %s" % (k, str(v))
+                  for k, v in sorted(dict(vars(args)).items()))
     )
     cudnn.benchmark = True
 
     # ============ building network ... ============
     # if the network is a Vision Transformer (i.e. vit_tiny, vit_small, vit_base)
     if args.arch in vits.__dict__.keys():
-        model = vits.__dict__[args.arch](patch_size=args.patch_size, num_classes=0)
+        model = vits.__dict__[args.arch](
+            patch_size=args.patch_size, num_classes=0)
         embed_dim = model.embed_dim * (
             args.n_last_blocks + int(args.avgpool_patchtokens)
         )
     # if the network is a XCiT
     elif "xcit" in args.arch:
-        model = torch.hub.load("facebookresearch/xcit:main", args.arch, num_classes=0)
+        model = torch.hub.load(
+            "facebookresearch/xcit:main", args.arch, num_classes=0)
         embed_dim = model.embed_dim
     # otherwise, we check if the architecture is in torchvision models
     elif args.arch in torchvision_models.__dict__.keys():
@@ -75,7 +79,8 @@ def eval_linear(args):
             pth_transforms.Resize(256, interpolation=3),
             pth_transforms.CenterCrop(224),
             pth_transforms.ToTensor(),
-            pth_transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+            pth_transforms.Normalize(
+                (0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
         ]
     )
     dataset_val = datasets.ImageFolder(
@@ -109,7 +114,8 @@ def eval_linear(args):
             pth_transforms.RandomResizedCrop(224),
             pth_transforms.RandomHorizontalFlip(),
             pth_transforms.ToTensor(),
-            pth_transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+            pth_transforms.Normalize(
+                (0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
         ]
     )
     dataset_train = datasets.ImageFolder(
@@ -197,7 +203,8 @@ def eval_linear(args):
                 "scheduler": scheduler.state_dict(),
                 "best_acc": best_acc,
             }
-            torch.save(save_dict, os.path.join(args.output_dir, "checkpoint.pth.tar"))
+            torch.save(save_dict, os.path.join(
+                args.output_dir, "checkpoint.pth.tar"))
     print(
         "Training of the supervised linear classifier on frozen features completed.\n"
         "Top-1 test accuracy: {acc:.1f}".format(acc=best_acc)
@@ -207,7 +214,8 @@ def eval_linear(args):
 def train(model, linear_classifier, optimizer, loader, epoch, n, avgpool):
     linear_classifier.train()
     metric_logger = utils.MetricLogger(delimiter="  ")
-    metric_logger.add_meter("lr", utils.SmoothedValue(window_size=1, fmt="{value:.6f}"))
+    metric_logger.add_meter("lr", utils.SmoothedValue(
+        window_size=1, fmt="{value:.6f}"))
     header = "Epoch: [{}]".format(epoch)
     for (inp, target) in metric_logger.log_every(loader, 20, header):
         # move to gpu
@@ -218,7 +226,8 @@ def train(model, linear_classifier, optimizer, loader, epoch, n, avgpool):
         with torch.no_grad():
             if "vit" in args.arch:
                 intermediate_output = model.get_intermediate_layers(inp, n)
-                output = torch.cat([x[:, 0] for x in intermediate_output], dim=-1)
+                output = torch.cat([x[:, 0]
+                                   for x in intermediate_output], dim=-1)
                 if avgpool:
                     output = torch.cat(
                         (
@@ -268,7 +277,8 @@ def validate_network(val_loader, model, linear_classifier, n, avgpool):
         with torch.no_grad():
             if "vit" in args.arch:
                 intermediate_output = model.get_intermediate_layers(inp, n)
-                output = torch.cat([x[:, 0] for x in intermediate_output], dim=-1)
+                output = torch.cat([x[:, 0]
+                                   for x in intermediate_output], dim=-1)
                 if avgpool:
                     output = torch.cat(
                         (
@@ -348,7 +358,8 @@ if __name__ == "__main__":
         help="""Whether ot not to concatenate the global average pooled features to the [CLS] token.
         We typically set this to False for ViT-Small and to True with ViT-Base.""",
     )
-    parser.add_argument("--arch", default="vit_small", type=str, help="Architecture")
+    parser.add_argument("--arch", default="vit_small",
+                        type=str, help="Architecture")
     parser.add_argument(
         "--patch_size", default=16, type=int, help="Patch resolution of the model."
     )
@@ -395,7 +406,7 @@ if __name__ == "__main__":
     parser.add_argument("--data_path", default="/path/to/imagenet/", type=str)
     parser.add_argument(
         "--num_workers",
-        default=10,
+        default=5,
         type=int,
         help="Number of data loading workers per GPU.",
     )
