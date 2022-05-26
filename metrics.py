@@ -30,8 +30,8 @@ def predict_coxph_surv(
     cumulative_baseline_hazards = baseline_hazards.cumsum(0)
 
     surv = output2surv(test_outputs, cumulative_baseline_hazards)
-    surv = pd.DataFrame(surv.transpose(0, 1), durations.cpu().numpy())
-    # surv.to_pickle(Path(output_dir) / "surv.pkl")
+    surv = pd.DataFrame(surv.transpose(0, 1).cpu().numpy(), durations.cpu().numpy())
+    surv.to_pickle(Path(output_dir) / "surv.pkl")
 
     return surv
 
@@ -67,8 +67,7 @@ def auc(surv, durations, events, years=(1, 2, 5)):
         y[(durations <= year) & (events == 0)] = 0
         y[(durations <= year) & (events == 1)] = 1
 
-        print(pred.head())
-        pred = surv[surv.index > year]
+        pred = surv[surv.index > year].iloc[0]
         fpr, tpr, thresholds = metrics.roc_curve(y, pred, pos_label=1)
         auc = metrics.auc(fpr, tpr)
         print(

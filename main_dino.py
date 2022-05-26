@@ -36,7 +36,7 @@ import utils
 import vision_transformer as vits
 from vision_transformer import DINOHead
 
-from chimec import ChiMECSSLDataset
+from chimec import load_metadata, ChiMECSSLDataset
 from maicara.data.constants import CHIMEC_MEAN, CHIMEC_STD
 from maicara.preprocessing.utils import log_code_state
 
@@ -166,7 +166,7 @@ def get_args_parser():
         help="Per-GPU batch-size: number of distinct images loaded on one GPU.",
     )
     parser.add_argument(
-        "--epochs", default=800, type=int, help="Number of epochs of training."
+        "--epochs", default=400, type=int, help="Number of epochs of training."
     )
     parser.add_argument(
         "--freeze_last_layer",
@@ -239,15 +239,24 @@ def get_args_parser():
     parser.add_argument(
         "--output_dir", default=".", type=str, help="Path to save logs and checkpoints."
     )
-    parser.add_argument(
-        "--saveckp_freq", default=100, type=int, help="Save checkpoint every x epochs."
-    )
     parser.add_argument("--seed", default=None, type=int, help="Random seed.")
     parser.add_argument(
         "--num_workers",
         default=5,
         type=int,
         help="Number of data loading workers per GPU.",
+    )
+    parser.add_argument(
+        "--test_size",
+        default=0.15,
+        type=float,
+        help="Proportion of finetuning dataset to hold out for testing; these patients will be excluded from pretraining dataset to avoid data leakage",
+    )
+    parser.add_argument(
+        "--prescale",
+        default=1.0,
+        type=float,
+        help="""Only use PRESCALE percent of data (for development).""",
     )
     parser.add_argument(
         "--dist_url",
@@ -279,8 +288,6 @@ def train_dino(gpu, args):
     args.gpu = gpu
     args.rank = gpu
     utils.init_distributed_mode(args)
-    if args.seed is None:
-        args.seed = torch.randint(0, 100000, (1,)).item()
     utils.fix_random_seeds(args.seed)
     cudnn.benchmark = True
 
@@ -303,13 +310,20 @@ def train_dino(gpu, args):
     )
 
     # ============ preparing data ... ============
+    # exclude any patients in testing set from pretraining set
+    fit_metadata, test_metadata = load_metadata(args.test_size)
     transform = DataAugmentationDINO(
         args.global_crops_scale,
         args.local_crops_scale,
         args.local_crops_number,
     )
-    # TODO do not hardcode
-    dataset = ChiMECSSLDataset(transform, image_size=224, prescale=1.0)
+    # TODO do not hardcode size
+    dataset = ChiMECSSLDataset(
+        transform,
+        exclude=test_metadata.study_id,
+        image_size=224,
+        prescale=args.prescale,
+    )
     sampler = torch.utils.data.DistributedSampler(dataset, shuffle=True)
     data_loader = torch.utils.data.DataLoader(
         dataset,
@@ -319,7 +333,7 @@ def train_dino(gpu, args):
         pin_memory=True,
         drop_last=True,
     )
-    logger.info(f"Data loaded: there are {len(dataset)} images.")
+    logger.info(f"Data loaded: there are {len(dataset)} (CC, MLO) view sets.")
 
     # ============ building student and teacher networks ... ============
     # we changed the name DeiT-S for ViT-S to avoid confusions
@@ -385,7 +399,7 @@ def train_dino(gpu, args):
     # there is no backpropagation through the teacher, so no need for gradients
     for p in teacher.parameters():
         p.requires_grad = False
-    logger.info(f"Student and Teacher are built: they are both {args.arch} network.")
+    logger.info(f"Student and teacher are built: they are both {args.arch} network.")
 
     # ============ preparing loss ... ============
     dino_loss = DINOLoss(
@@ -437,10 +451,14 @@ def train_dino(gpu, args):
     logger.info(f"Loss, optimizer and schedulers ready.")
 
     # ============ optionally resume training ... ============
-    to_restore = {"epoch": 0}
+    to_restore = {
+        "epoch": 0,
+        "fit_metadata": fit_metadata,
+        "test_metadata": test_metadata,
+    }
     utils.restart_from_checkpoint(
         os.path.join(args.output_dir, "checkpoint.pth"),
-        run_variables=to_restore,
+        restore_objects=to_restore,
         student=student,
         teacher=teacher,
         optimizer=optimizer,
@@ -448,6 +466,8 @@ def train_dino(gpu, args):
         dino_loss=dino_loss,
     )
     start_epoch = to_restore["epoch"]
+    fit_metadata = to_restore["fit_metadata"]
+    test_metadata = to_restore["test_metadata"]
 
     start_time = time.time()
     logger.info("Starting DINO training!")
@@ -479,14 +499,12 @@ def train_dino(gpu, args):
             "epoch": epoch + 1,
             "args": args,
             "dino_loss": dino_loss.state_dict(),
+            "fit_metadata": fit_metadata,
+            "test_metadata": test_metadata,
         }
         if fp16_scaler is not None:
             save_dict["fp16_scaler"] = fp16_scaler.state_dict()
         utils.save_on_master(save_dict, os.path.join(args.output_dir, "checkpoint.pth"))
-        if args.saveckp_freq and epoch % args.saveckp_freq == 0:
-            utils.save_on_master(
-                save_dict, os.path.join(args.output_dir, f"checkpoint{epoch:04}.pth")
-            )
         log_stats = {
             **{f"train_{k}": v for k, v in train_stats.items()},
             "epoch": epoch,
@@ -716,6 +734,8 @@ class DataAugmentationDINO(object):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser("DINO", parents=[get_args_parser()])
     args = parser.parse_args()
+    if args.seed is None:
+        args.seed = torch.randint(0, 100000, (1,)).item()
     if args.devices is None:
         args.devices = [f"{i}" for i in range(torch.cuda.device_count())]
     if args.world_size is None:

@@ -24,7 +24,7 @@ import torch.backends.cudnn as cudnn
 from torchvision import transforms as pth_transforms
 
 from maicara.data.constants import CHIMEC_MEAN, CHIMEC_STD
-from chimec import load_datasets
+from chimec import get_datasets
 
 import utils
 import vision_transformer as vits
@@ -37,8 +37,6 @@ def eval_finetune(gpu, args):
     args.gpu = gpu
     args.rank = gpu
     utils.init_distributed_mode(args)
-    if args.seed is None:
-        args.seed = torch.randint(0, 100000, (1,)).item()
     utils.fix_random_seeds(args.seed)
     logger = utils.setup_logging(args.rank, args.output_dir, "finetune")
     logger.info("git:\n  {}\n".format(utils.get_sha()))
@@ -59,8 +57,8 @@ def eval_finetune(gpu, args):
     model.cuda()
     model.eval()
     # load weights to evaluate
-    utils.load_pretrained_weights(
-        model, args.pretrained_weights, args.checkpoint_key, args.arch, args.patch_size
+    fit_metadata, test_metadata = utils.load_pretrained_weights_and_metadata(
+        model, args.pretrained_weights, args.checkpoint_key
     )
     logger.info(f"Model {args.arch} built.")
 
@@ -96,37 +94,6 @@ def eval_finetune(gpu, args):
             pth_transforms.Normalize(CHIMEC_MEAN, CHIMEC_STD),
         ]
     )
-    train_dataset, val_dataset, test_dataset = load_datasets(
-        args.prescale,
-        args.test_size,
-        args.val_size,
-        train_transform,
-        val_transform,
-    )
-
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset,
-        sampler=torch.utils.data.distributed.DistributedSampler(train_dataset),
-        batch_size=args.batch_size_per_gpu,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        drop_last=True,
-    )
-    val_loader = torch.utils.data.DataLoader(
-        val_dataset,
-        batch_size=args.batch_size_per_gpu,
-        num_workers=0,
-        pin_memory=True,
-    )
-    test_loader = torch.utils.data.DataLoader(
-        test_dataset,
-        batch_size=args.batch_size_per_gpu,
-        num_workers=0,
-        pin_memory=True,
-    )
-    logger.info(
-        f"Data loaded with {len(train_dataset)} train, {len(val_dataset)} val, and {len(test_dataset)} test images."
-    )
     if args.evaluate:
         ## TODO add train outputs/durations/events to checkpoint; these are needed for evaluation
         raise NotImplementedError
@@ -154,88 +121,139 @@ def eval_finetune(gpu, args):
     to_restore = {
         "epoch": 0,
         "best_c_index": 0.0,
-        "train_loader": train_loader,
-        "val_loader": val_loader,
-        "test_loader": test_loader,
+        "fold": 0,
+        "fit_loader": None,
+        "test_loader": None,
     }
     utils.restart_from_checkpoint(
         os.path.join(args.output_dir, "checkpoint.pth.tar"),
-        run_variables=to_restore,
+        restore_objects=to_restore,
         state_dict=mlp,
         optimizer=optimizer,
         scheduler=scheduler,
     )
     start_epoch = to_restore["epoch"]
     best_c_index = to_restore["best_c_index"]
-    train_loader = to_restore["train_loader"]
-    val_loader = to_restore["val_loader"]
+    fit_loaders = to_restore["fit_loader"]
     test_loader = to_restore["test_loader"]
+    fold = to_restore["fold"]
 
-    for epoch in range(start_epoch, args.epochs):
-        train_loader.sampler.set_epoch(epoch)
-
-        train_stats, train_outputs, train_durations, train_events = train(
-            mlp, optimizer, train_loader, epoch
+    if fit_loaders is None:
+        fit_datasets, test_dataset = get_datasets(
+            args.prescale,
+            train_transform,
+            val_transform,
+            test_metadata,
+            fit_metadata,
+            args.folds,
+            args.seed,
         )
-        scheduler.step()
+        fit_loaders = [
+            (
+                torch.utils.data.DataLoader(
+                    train_dataset,
+                    sampler=torch.utils.data.distributed.DistributedSampler(
+                        train_dataset
+                    ),
+                    batch_size=args.batch_size_per_gpu,
+                    num_workers=args.num_workers,
+                    pin_memory=True,
+                    drop_last=True,
+                ),
+                torch.utils.data.DataLoader(
+                    val_dataset,
+                    batch_size=args.batch_size_per_gpu,
+                    num_workers=0,
+                    pin_memory=True,
+                ),
+            )
+            for train_dataset, val_dataset in fit_datasets
+        ]
 
-        log_stats = {
-            **{f"train_{k}": v for k, v in train_stats.items()},
-            "epoch": epoch,
-        }
-        if utils.is_main_process():
-            with (Path(args.output_dir) / "train_log.txt").open("a") as f:
-                f.write(json.dumps(log_stats) + "\n")
-            save_dict = {
-                "epoch": epoch + 1,
-                "state_dict": mlp.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "scheduler": scheduler.state_dict(),
-                "best_c_index": best_c_index,
-                "train_loader": train_loader,
-                "val_loader": val_loader,
-                "test_loader": test_loader,
+        test_loader = torch.utils.data.DataLoader(
+            test_dataset,
+            batch_size=args.batch_size_per_gpu,
+            num_workers=0,
+            pin_memory=True,
+        )
+    logger.info(f"Data loaded with {len(test_dataset)} test exams")
+    for i, (train_dataset, val_dataset) in enumerate(fit_datasets):
+        logger.info(
+            f"Fold {i}: {len(train_dataset)} training exams and {len(val_dataset)} val exams"
+        )
+
+    for i, (train_loader, val_loader) in enumerate(fit_loaders):
+        if i < fold:
+            continue
+        for epoch in range(start_epoch, args.epochs):
+            train_loader.sampler.set_epoch(epoch)
+
+            train_stats, train_outputs, train_durations, train_events = train(
+                mlp, optimizer, train_loader, epoch
+            )
+            scheduler.step()
+
+            log_stats = {
+                **{f"train_{k}": v for k, v in train_stats.items()},
+                "epoch": epoch,
             }
-            torch.save(save_dict, os.path.join(args.output_dir, "checkpoint.pth.tar"))
-        if (epoch % args.val_freq == 0 or epoch == args.epochs - 1) and (
-            epoch >= args.val_start
-        ):
             if utils.is_main_process():
-                val_stats = validate_network(
-                    val_loader,
-                    # val_dataset,
-                    mlp,
-                    train_outputs,
-                    train_durations,
-                    train_events,
-                    args.output_dir,
-                )
-                logger.info(
-                    f"Concordance index at epoch {epoch} of the network on the {len(val_dataset)} test images: {val_stats['c_index']:.3f}"
-                )
-                if best_c_index < val_stats["c_index"]:
-                    best_c_index = val_stats["c_index"]
-                    save_dict = {
-                        "epoch": epoch + 1,
-                        "state_dict": mlp.state_dict(),
-                        "optimizer": optimizer.state_dict(),
-                        "scheduler": scheduler.state_dict(),
-                        "best_c_index": best_c_index,
-                        "train_loader": train_loader,
-                        "val_loader": val_loader,
-                        "test_loader": test_loader,
-                    }
-                    torch.save(
-                        save_dict,
-                        os.path.join(args.output_dir, "best_checkpoint.pth.tar"),
-                    )
-                logger.info(f"Max c-index so far: {best_c_index:.3f}")
-                log_stats = {
-                    **{k: v for k, v in log_stats.items()},
-                    **{f"val_{k}": v for k, v in val_stats.items()},
-                }
-                with (Path(args.output_dir) / "val_log.txt").open("a") as f:
+                with (Path(args.output_dir) / f"fold_{i}_train_log.txt").open("a") as f:
                     f.write(json.dumps(log_stats) + "\n")
+                save_dict = {
+                    "epoch": epoch + 1,
+                    "state_dict": mlp.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "scheduler": scheduler.state_dict(),
+                    "best_c_index": best_c_index,
+                    "fit_loaders": fit_loaders,
+                    "test_loader": test_loader,
+                    "fold": i,
+                }
+                torch.save(
+                    save_dict, os.path.join(args.output_dir, "checkpoint.pth.tar")
+                )
+            if epoch % args.val_freq == 0 or epoch == args.epochs - 1:
+                if epoch >= args.val_start:
+                    if utils.is_main_process():
+                        val_stats = validate_network(
+                            val_loader,
+                            mlp,
+                            train_outputs,
+                            train_durations,
+                            train_events,
+                            args.output_dir,
+                        )
+                        logger.info(
+                            f"Concordance index at epoch {epoch} of the network on the {len(val_loader) * args.batch_size_per_gpu} test images: {val_stats['c_index']:.3f}"
+                        )
+                        if best_c_index < val_stats["c_index"]:
+                            best_c_index = val_stats["c_index"]
+                            save_dict = {
+                                "epoch": epoch + 1,
+                                "state_dict": mlp.state_dict(),
+                                "optimizer": optimizer.state_dict(),
+                                "scheduler": scheduler.state_dict(),
+                                "best_c_index": best_c_index,
+                                "fit_loaders": fit_loaders,
+                                "test_loader": test_loader,
+                                "fold": i,
+                            }
+                            torch.save(
+                                save_dict,
+                                os.path.join(
+                                    args.output_dir, "best_checkpoint.pth.tar"
+                                ),
+                            )
+                        logger.info(f"Max c-index so far: {best_c_index:.3f}")
+                        log_stats = {
+                            **{k: v for k, v in log_stats.items()},
+                            **{f"val_{k}": v for k, v in val_stats.items()},
+                        }
+                        with (Path(args.output_dir) / f"fold_{i}_val_log.txt").open(
+                            "a"
+                        ) as f:
+                            f.write(json.dumps(log_stats) + "\n")
     logger.info(
         f"Training of the supervised MLP on frozen features completed.\n"
         f"Best validation concordance index: {best_c_index:.3f}"
@@ -256,8 +274,14 @@ def eval_finetune(gpu, args):
             args.output_dir,
         )
         logger.info(
-            f"Concordance index of the best-performing network in the validation set on the {len(test_dataset)} test images: {test_stats['c_index']:.3f}"
+            f"Concordance index of the best-performing network in the validation set on the {len(test_dataset)} test exams: {test_stats['c_index']:.3f}"
         )
+        log_stats = {
+            **{k: v for k, v in log_stats.items()},
+            **{f"test_{k}": v for k, v in test_stats.items()},
+        }
+        with (Path(args.output_dir) / "test_log.txt").open("a") as f:
+            f.write(json.dumps(log_stats) + "\n")
 
 
 def train(mlp, optimizer, loader, epoch):
@@ -269,7 +293,7 @@ def train(mlp, optimizer, loader, epoch):
     outputs = []
     durations = []
     events = []
-    for (image, contralateral_image, duration, event) in metric_logger.log_every(
+    for (image, contralateral_image, duration, event, _) in metric_logger.log_every(
         loader, 20, header
     ):
         image = image.cuda(non_blocking=True)
@@ -319,7 +343,12 @@ def train(mlp, optimizer, loader, epoch):
 
 @torch.no_grad()
 def validate_network(
-    val_loader, mlp, train_outputs, train_durations, train_events, output_dir
+    val_loader,
+    mlp,
+    train_outputs,
+    train_durations,
+    train_events,
+    output_dir,
 ):
     logger = logging.getLogger()
     mlp.eval()
@@ -345,6 +374,7 @@ def validate_network(
         loss = CoxPHLoss()(output, duration, event)
 
         metric_logger.update(loss=loss.item())
+
         outputs += [output]
         durations += [duration]
         events += [event]
@@ -456,9 +486,7 @@ class BilateralMLP(nn.Module):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        "Evaluation with linear classification on ImageNet"
-    )
+    parser = argparse.ArgumentParser("Finetune")
     parser.add_argument("--seed", default=None, type=int, help="Random seed.")
     parser.add_argument(
         "--n_last_blocks",
@@ -543,6 +571,9 @@ if __name__ == "__main__":
         "--val_start", default=0, type=int, help="Start validating at epoch VAL_START"
     )
     parser.add_argument(
+        "--folds", default=6, type=int, help="Number of validation folds"
+    )
+    parser.add_argument(
         "--output_dir", default=".", help="Path to save logs and checkpoints"
     )
     parser.add_argument(
@@ -551,8 +582,6 @@ if __name__ == "__main__":
         action="store_true",
         help="evaluate model on validation set",
     )
-    parser.add_argument("--test_size", default=0.15, type=float)
-    parser.add_argument("--val_size", default=0.15, type=float)
     parser.add_argument(
         "--world_size", default=None, type=int, help="number of distributed processes"
     )
@@ -564,12 +593,15 @@ if __name__ == "__main__":
         help="which devices to use on local machine",
     )
     args = parser.parse_args()
+    if args.seed is None:
+        args.seed = torch.randint(0, 100000, (1,)).item()
     if args.devices is None:
         args.devices = [f"{i}" for i in range(torch.cuda.device_count())]
     if args.world_size is None:
         args.world_size = len(args.devices)
     args.port = str(utils.get_unused_local_port())
-    Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+    for fold in range(args.folds):
+        Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     mp.spawn(
         eval_finetune,
         nprocs=len(args.devices),

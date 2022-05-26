@@ -159,7 +159,7 @@ class Block(nn.Module):
 class PatchEmbed(nn.Module):
     """Image to Patch Embedding"""
 
-    def __init__(self, img_size=224, patch_size=16, in_chans=1, embed_dim=768):
+    def __init__(self, img_size=224, patch_size=16, in_chans=2, embed_dim=768):
         super().__init__()
         num_patches = (img_size // patch_size) * (img_size // patch_size)
         self.img_size = img_size
@@ -183,7 +183,7 @@ class VisionTransformer(nn.Module):
         self,
         img_size=[224],
         patch_size=16,
-        in_chans=1,
+        in_chans=2,
         num_classes=0,
         embed_dim=768,
         depth=12,
