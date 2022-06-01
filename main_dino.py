@@ -36,7 +36,7 @@ import utils
 import vision_transformer as vits
 from vision_transformer import DINOHead
 
-from chimec import load_metadata, ChiMECSSLDataset
+from chimec import load_metadata, ChiMECSSLDataset, ChiMECStackedSSLDataset
 from maicara.data.constants import CHIMEC_MEAN, CHIMEC_STD
 from maicara.preprocessing.utils import log_code_state
 
@@ -166,7 +166,13 @@ def get_args_parser():
         help="Per-GPU batch-size: number of distinct images loaded on one GPU.",
     )
     parser.add_argument(
-        "--epochs", default=400, type=int, help="Number of epochs of training."
+        "--epochs", default=800, type=int, help="Number of epochs of training."
+    )
+    parser.add_argument(
+        "--patience",
+        default=15,
+        type=int,
+        help="How many epochs to wait before stopping when loss is not improving",
     )
     parser.add_argument(
         "--freeze_last_layer",
@@ -259,6 +265,12 @@ def get_args_parser():
         help="""Only use PRESCALE percent of data (for development).""",
     )
     parser.add_argument(
+        "--stack_views",
+        type=utils.bool_flag,
+        default=False,
+        help="""Whether or not to stack CC and MLO views in the color channel""",
+    )
+    parser.add_argument(
         "--dist_url",
         default="env://",
         type=str,
@@ -311,6 +323,7 @@ def train_dino(gpu, args):
 
     # ============ preparing data ... ============
     # exclude any patients in testing set from pretraining set
+    # fit = val + train sets
     fit_metadata, test_metadata = load_metadata(args.test_size)
     transform = DataAugmentationDINO(
         args.global_crops_scale,
@@ -318,7 +331,8 @@ def train_dino(gpu, args):
         args.local_crops_number,
     )
     # TODO do not hardcode size
-    dataset = ChiMECSSLDataset(
+    SSLDataset = ChiMECStackedSSLDataset if args.stack_views else ChiMECSSLDataset
+    dataset = SSLDataset(
         transform,
         exclude=test_metadata.study_id,
         image_size=224,
@@ -333,35 +347,26 @@ def train_dino(gpu, args):
         pin_memory=True,
         drop_last=True,
     )
-    logger.info(f"Data loaded: there are {len(dataset)} (CC, MLO) view sets.")
 
     # ============ building student and teacher networks ... ============
     # we changed the name DeiT-S for ViT-S to avoid confusions
     args.arch = args.arch.replace("deit", "vit")
     # if the network is a Vision Transformer (i.e. vit_tiny, vit_small, vit_base)
+    in_chans = 2 if args.stack_views else 1
     if args.arch in vits.__dict__.keys():
         student = vits.__dict__[args.arch](
             patch_size=args.patch_size,
             drop_path_rate=args.drop_path_rate,  # stochastic depth
+            in_chans=in_chans,
         )
-        teacher = vits.__dict__[args.arch](patch_size=args.patch_size)
-        embed_dim = student.embed_dim
-    # if the network is a XCiT
-    elif args.arch in torch.hub.list("facebookresearch/xcit:main"):
-        student = torch.hub.load(
-            "facebookresearch/xcit:main",
-            args.arch,
-            pretrained=False,
-            drop_path_rate=args.drop_path_rate,
-        )
-        teacher = torch.hub.load(
-            "facebookresearch/xcit:main", args.arch, pretrained=False
+        teacher = vits.__dict__[args.arch](
+            patch_size=args.patch_size, in_chans=in_chans
         )
         embed_dim = student.embed_dim
     # otherwise, we check if the architecture is in torchvision models
     elif args.arch in torchvision_models.__dict__.keys():
-        student = torchvision_models.__dict__[args.arch]()
-        teacher = torchvision_models.__dict__[args.arch]()
+        student = torchvision_models.__dict__[args.arch](in_chans=in_chans)
+        teacher = torchvision_models.__dict__[args.arch](in_chans=in_chans)
         embed_dim = student.fc.weight.shape[1]
     else:
         logger.error(f"Unknow architecture: {args.arch}")
@@ -469,6 +474,8 @@ def train_dino(gpu, args):
     fit_metadata = to_restore["fit_metadata"]
     test_metadata = to_restore["test_metadata"]
 
+    early_stopping = utils.EarlyStopping(patience=args.patience)
+
     start_time = time.time()
     logger.info("Starting DINO training!")
     for epoch in range(start_epoch, args.epochs):
@@ -490,6 +497,9 @@ def train_dino(gpu, args):
             args,
             logger,
         )
+        early_stopping(train_stats["loss"])
+        if early_stopping.early_stop:
+            break
 
         # ============ writing logs ... ============
         save_dict = {
@@ -501,6 +511,7 @@ def train_dino(gpu, args):
             "dino_loss": dino_loss.state_dict(),
             "fit_metadata": fit_metadata,
             "test_metadata": test_metadata,
+            "in_chans": in_chans,
         }
         if fp16_scaler is not None:
             save_dict["fp16_scaler"] = fp16_scaler.state_dict()

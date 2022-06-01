@@ -95,6 +95,69 @@ class ChiMECSSLDataset(Dataset):
             print(
                 f"dropped {original - metadata.exam_id.nunique()} exams from patients in the finetuning testing set"
             )
+        if prescale:
+            # need to ensure we get some cases, even for small prescale values
+            cases = metadata[metadata.event == 1].sample(frac=min(prescale * 3, 1))
+            controls = metadata[metadata.event == 0].sample(frac=prescale)
+            metadata = pd.concat([cases, controls]).sample(frac=1)
+        self.metadata = metadata
+        print_summary("pretraining mammo\n\n", self.metadata)
+        # TODO ensure all inputs are in same orientation
+        # TODO fix aspect ratio-- unilateral images should have final size h, h/2.
+        self.resize = transforms.Resize(to_2tuple(image_size))
+        self.transform = transform
+
+    def load_png(self, filename):
+        try:
+            image = Image.open(filename).convert("L")
+        except OSError:
+            time.sleep(2)
+            image = Image.open(filename).convert("L")
+        return image
+
+    def __len__(self) -> int:
+        length = 0
+        if self.metadata is not None:
+            length = len(self.metadata)
+
+        return length
+
+    def __getitem__(self, idx: int) -> Tuple:
+        """Get item.
+
+        Args:
+            idx (int): Index in the metadata table to retrieve.
+
+        Returns:
+            Tuple of images:
+        """
+        series = self.metadata.iloc[idx]
+        filename = series["png_path"]
+        image = self.resize(self.load_png(filename))
+        return self.transform(image)
+
+
+class ChiMECStackedSSLDataset(Dataset):
+    def __init__(
+        self,
+        transform,
+        exclude: pd.core.series.Series = None,
+        image_size: int = 224,
+        prescale: float = 1.0,
+    ):
+        metadata = pd.read_pickle(
+            "/gpfs/data/huo-lab/Image/annawoodard/maicara/data/interim/mammo_loose_cuts_v3/series_metadata.pkl"
+        )
+        # metadata passing all filters will have `np.nan` in the `filter` column
+        metadata = metadata[
+            (pd.isnull(metadata["filter"])) & (~pd.isnull(metadata["png_path"]))
+        ]
+        if exclude is not None:
+            original = metadata.exam_id.nunique()
+            metadata = metadata[~metadata["study_id"].isin(exclude)]
+            print(
+                f"dropped {original - metadata.exam_id.nunique()} exams from patients in the finetuning testing set"
+            )
 
         if prescale:
             # need to ensure we get some cases, even for small prescale values
@@ -175,7 +238,120 @@ class ChiMECSSLDataset(Dataset):
         return res
 
 
-class ChiMECFinetuningDataset(Dataset):
+class ChiMECFinetuningTrainingDataset(Dataset):
+    def __init__(
+        self,
+        metadata: Union[str, os.PathLike],
+        image_transform: Optional[Callable] = None,
+    ):
+        self.metadata = metadata
+        self.image_transform = image_transform
+        original = len(self.metadata.exam_id.unique())
+        # FIXME sometimes additional views are coded as different exams, need to select on time
+        # rather than exam ID if we are losing many exams
+        self.exams = []
+        for exam in metadata.exam_id.unique():
+            lateralities = metadata[metadata.exam_id == exam].ImageLaterality.tolist()
+            if set(["L", "R"]) == set(lateralities):
+                self.exams += [exam]
+        if (original - len(self.exams)) > 0:
+            print(
+                f"Removed {original - len(self.exams)} exams without both lateralities"
+            )
+
+    def load_image(self, filename):
+        image = Image.open(filename).convert("L")
+        if self.image_transform is not None:
+            return self.image_transform(image)
+        return image
+
+    def __len__(self) -> int:
+        return len(self.metadata)
+
+    def __getitem__(self, idx: int) -> Dict:
+        series = self.metadata.iloc[idx]
+        filename = series["png_path"]
+        image = self.load_image(filename)
+        contralateral_views = self.metadata[
+            (self.metadata.study_id == series.study_id)
+            & (self.metadata.exam_id == series.exam_id)
+            & (self.metadata.ImageLaterality != series.ImageLaterality)
+        ]
+        if len(contralateral_views) > 0:
+            contralateral_filename = contralateral_views.sample(1).png_path.item()
+            contralateral_image = self.load_image(contralateral_filename)
+        else:
+            contralateral_image = image.clone()
+
+        return (
+            image,
+            contralateral_image,
+            series["duration"],
+            series["years_to_event"],
+            series["event"],
+            series["study_id"],
+        )
+
+
+class ChiMECFinetuningEvalDataset(Dataset):
+    def __init__(
+        self,
+        metadata: Union[str, os.PathLike],
+        image_transform: Optional[Callable] = None,
+    ):
+        self.metadata = metadata
+        self.image_transform = image_transform
+        original = len(self.metadata.exam_id.unique())
+        # FIXME sometimes additional views are coded as different exams, need to select on time
+        # rather than exam ID if we are losing many exams
+        self.exams = []
+        for exam in metadata.exam_id.unique():
+            lateralities = metadata[metadata.exam_id == exam].ImageLaterality.tolist()
+            cc_views = metadata[
+                (metadata.exam_id == exam) & (metadata.ViewPosition == "CC")
+            ].ViewPosition.tolist()
+            if (set(["L", "R"]) == set(lateralities)) and (len(cc_views) >= 2):
+                self.exams += [exam]
+        if (original - len(self.exams)) > 0:
+            print(
+                f"Removed {original - len(self.exams)} exams without both lateralities and CC views"
+            )
+
+    def load_image(self, filename):
+        image = Image.open(filename).convert("L")
+        if self.image_transform is not None:
+            return self.image_transform(image)
+        return image
+
+    def __len__(self) -> int:
+        return len(self.exams)
+
+    def __getitem__(self, idx: int) -> Dict:
+        exam = self.exams[idx]
+        left_row = self.metadata[
+            (self.metadata.exam_id == exam)
+            & (self.metadata.ViewPosition == "CC")
+            & (self.metadata.ImageLaterality == "L")
+        ].sample(1)
+        right_row = self.metadata[
+            (self.metadata.exam_id == exam)
+            & (self.metadata.ViewPosition == "CC")
+            & (self.metadata.ImageLaterality == "R")
+        ].sample(1)
+        l_cc_view = self.resize(self.load_image(left_row.png_path.item()))
+        r_cc_view = self.resize(self.load_image(right_row.png_path.item()))
+
+        return (
+            l_cc_view,
+            r_cc_view,
+            left_row["duration"],
+            left_row["years_to_event"],
+            left_row["event"],
+            left_row["study_id"],
+        )
+
+
+class ChiMECStackedFinetuningDataset(Dataset):
     def __init__(
         self,
         metadata: Union[str, os.PathLike],

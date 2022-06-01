@@ -88,10 +88,16 @@ def get_unused_local_port():
     return port
 
 
-def load_pretrained_weights_and_metadata(model, pretrained_weights, checkpoint_key):
+def get_input_channels(checkpoint):
+    state_dict = torch.load(checkpoint, map_location="cpu")
+    return state_dict.pop("in_chans")
+
+
+def load_pretrained_checkpoint(model, pretrained_weights, checkpoint_key):
     state_dict = torch.load(pretrained_weights, map_location="cpu")
     fit_metadata = state_dict.pop("fit_metadata")
     test_metadata = state_dict.pop("test_metadata")
+    state_dict.pop("in_chans")
     if checkpoint_key is not None and checkpoint_key in state_dict:
         logger.info(f"Take key {checkpoint_key} in provided checkpoint dict")
         state_dict = state_dict[checkpoint_key]
@@ -914,3 +920,39 @@ def multi_scale(samples, model):
     v /= 3
     v /= v.norm()
     return v
+
+
+class EarlyStopping:
+    """
+    Early stopping to stop the training when the loss does not improve after
+    certain epochs.
+
+    Source: https://debuggercafe.com/using-learning-rate-scheduler-and-early-stopping-with-pytorch/
+    """
+
+    def __init__(self, patience=15, min_delta=0):
+        """
+        :param patience: how many epochs to wait before stopping when loss is
+               not improving
+        :param min_delta: minimum difference between new loss and old loss for
+               new loss to be considered as an improvement
+        """
+        self.patience = patience
+        self.min_delta = min_delta
+        self.counter = 0
+        self.best_loss = None
+        self.early_stop = False
+
+    def __call__(self, val_loss):
+        if self.best_loss == None:
+            self.best_loss = val_loss
+        elif self.best_loss - val_loss > self.min_delta:
+            self.best_loss = val_loss
+            # reset counter if validation loss improves
+            self.counter = 0
+        elif self.best_loss - val_loss < self.min_delta:
+            self.counter += 1
+            logger.info(f"Early stopping counter {self.counter} of {self.patience}")
+            if self.counter >= self.patience:
+                logger.info("Early stopping")
+                self.early_stop = True

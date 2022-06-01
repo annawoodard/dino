@@ -45,10 +45,12 @@ def eval_finetune(gpu, args):
     )
     cudnn.benchmark = True
 
+    in_chans = utils.get_input_channels(args.pretrained_weights)
+
     # ============ building network ... ============
     # if the network is a Vision Transformer (i.e. vit_tiny, vit_small, vit_base)
     if args.arch in vits.__dict__.keys():
-        model = vits.__dict__[args.arch](patch_size=args.patch_size, num_classes=0)
+        model = vits.__dict__[args.arch](patch_size=args.patch_size, num_classes=0, in_chans=in_chans)
         embed_dim = model.embed_dim * (
             args.n_last_blocks + int(args.avgpool_patchtokens)
         )
@@ -57,7 +59,7 @@ def eval_finetune(gpu, args):
     model.cuda()
     model.eval()
     # load weights to evaluate
-    fit_metadata, test_metadata = utils.load_pretrained_weights_and_metadata(
+    fit_metadata, test_metadata = utils.load_pretrained_checkpoint(
         model, args.pretrained_weights, args.checkpoint_key
     )
     logger.info(f"Model {args.arch} built.")
