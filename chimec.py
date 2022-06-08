@@ -286,7 +286,6 @@ class ChiMECFinetuningTrainingDataset(Dataset):
         return (
             image,
             contralateral_image,
-            series["duration"],
             series["years_to_event"],
             series["event"],
             series["study_id"],
@@ -338,16 +337,15 @@ class ChiMECFinetuningEvalDataset(Dataset):
             & (self.metadata.ViewPosition == "CC")
             & (self.metadata.ImageLaterality == "R")
         ].sample(1)
-        l_cc_view = self.resize(self.load_image(left_row.png_path.item()))
-        r_cc_view = self.resize(self.load_image(right_row.png_path.item()))
+        l_cc_view = self.load_image(left_row.png_path.item())
+        r_cc_view = self.load_image(right_row.png_path.item())
 
         return (
             l_cc_view,
             r_cc_view,
-            left_row["duration"],
-            left_row["years_to_event"],
-            left_row["event"],
-            left_row["study_id"],
+            left_row["years_to_event"].values[0],
+            left_row["event"].values[0],
+            left_row["study_id"].values[0],
         )
 
 
@@ -513,10 +511,10 @@ def get_datasets(
     dummy_x = np.ones(len(fit_metadata))  # This is a vestige in sklearn's API, not used
     fit_datasets = [
         (
-            ChiMECFinetuningDataset(
+            ChiMECFinetuningTrainingDataset(
                 fit_metadata.iloc[train_indexes], image_transform=train_transform
             ),
-            ChiMECFinetuningDataset(
+            ChiMECFinetuningEvalDataset(
                 fit_metadata.iloc[val_indexes],
                 image_transform=val_transform,
             ),
@@ -526,7 +524,7 @@ def get_datasets(
         )
     ]
 
-    test_dataset = ChiMECFinetuningDataset(
+    test_dataset = ChiMECFinetuningEvalDataset(
         test_metadata,
         image_transform=val_transform,
     )

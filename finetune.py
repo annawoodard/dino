@@ -50,7 +50,9 @@ def eval_finetune(gpu, args):
     # ============ building network ... ============
     # if the network is a Vision Transformer (i.e. vit_tiny, vit_small, vit_base)
     if args.arch in vits.__dict__.keys():
-        model = vits.__dict__[args.arch](patch_size=args.patch_size, num_classes=0, in_chans=in_chans)
+        model = vits.__dict__[args.arch](
+            patch_size=args.patch_size, num_classes=0, in_chans=in_chans
+        )
         embed_dim = model.embed_dim * (
             args.n_last_blocks + int(args.avgpool_patchtokens)
         )
@@ -90,6 +92,7 @@ def eval_finetune(gpu, args):
     )
     train_transform = pth_transforms.Compose(
         [
+            pth_transforms.Resize(448, interpolation=3),
             pth_transforms.RandomResizedCrop(224),
             pth_transforms.RandomHorizontalFlip(),
             pth_transforms.ToTensor(),
@@ -187,10 +190,11 @@ def eval_finetune(gpu, args):
     for i, (train_loader, val_loader) in enumerate(fit_loaders):
         if i < fold:
             continue
+        early_stopping = utils.EarlyStopping(patience=args.patience)
         for epoch in range(start_epoch, args.epochs):
             train_loader.sampler.set_epoch(epoch)
 
-            train_stats, train_outputs, train_durations, train_events = train(
+            train_stats, train_outputs, train_years_to_event, train_events = train(
                 mlp, optimizer, train_loader, epoch
             )
             scheduler.step()
@@ -222,10 +226,15 @@ def eval_finetune(gpu, args):
                             val_loader,
                             mlp,
                             train_outputs,
-                            train_durations,
+                            train_years_to_event,
                             train_events,
                             args.output_dir,
                         )
+                        early_stopping(
+                            val_stats["loss"]
+                        )  # TODO stop on c index? It is noisier than loss
+                        if early_stopping.early_stop:
+                            break
                         logger.info(
                             f"Concordance index at epoch {epoch} of the network on the {len(val_loader) * args.batch_size_per_gpu} test images: {val_stats['c_index']:.3f}"
                         )
@@ -256,34 +265,36 @@ def eval_finetune(gpu, args):
                             "a"
                         ) as f:
                             f.write(json.dumps(log_stats) + "\n")
+        # FIXME do not test every fold, need to stop and retrain on tuned HPs with no val
+        utils.restart_from_checkpoint(
+            os.path.join(args.output_dir, "best_checkpoint.pth.tar"),
+            state_dict=mlp,
+            optimizer=optimizer,
+            scheduler=scheduler,
+        )
+        if utils.is_main_process():
+            test_stats = validate_network(
+                test_loader,
+                mlp,
+                train_outputs,
+                train_years_to_event,
+                train_events,
+                args.output_dir,
+            )
+            logger.info(
+                f"Concordance index of the best-performing network in the validation set on the {len(test_dataset)} test exams: {test_stats['c_index']:.3f}"
+            )
+            log_stats = {
+                **{k: v for k, v in log_stats.items()},
+                **{f"test_{k}": v for k, v in test_stats.items()},
+            }
+            with (Path(args.output_dir) / "test_log.txt").open("a") as f:
+                f.write(json.dumps(log_stats) + "\n")
+
     logger.info(
         f"Training of the supervised MLP on frozen features completed.\n"
         f"Best validation concordance index: {best_c_index:.3f}"
     )
-    utils.restart_from_checkpoint(
-        os.path.join(args.output_dir, "best_checkpoint.pth.tar"),
-        state_dict=mlp,
-        optimizer=optimizer,
-        scheduler=scheduler,
-    )
-    if utils.is_main_process():
-        test_stats = validate_network(
-            test_loader,
-            mlp,
-            train_outputs,
-            train_durations,
-            train_events,
-            args.output_dir,
-        )
-        logger.info(
-            f"Concordance index of the best-performing network in the validation set on the {len(test_dataset)} test exams: {test_stats['c_index']:.3f}"
-        )
-        log_stats = {
-            **{k: v for k, v in log_stats.items()},
-            **{f"test_{k}": v for k, v in test_stats.items()},
-        }
-        with (Path(args.output_dir) / "test_log.txt").open("a") as f:
-            f.write(json.dumps(log_stats) + "\n")
 
 
 def train(mlp, optimizer, loader, epoch):
@@ -295,18 +306,22 @@ def train(mlp, optimizer, loader, epoch):
     outputs = []
     durations = []
     events = []
-    for (image, contralateral_image, duration, event, _) in metric_logger.log_every(
-        loader, 20, header
-    ):
+    for (
+        image,
+        contralateral_image,
+        years_to_event,
+        event,
+        _,
+    ) in metric_logger.log_every(loader, 20, header):
         image = image.cuda(non_blocking=True)
         contralateral_image = contralateral_image.cuda(non_blocking=True)
-        duration = duration.cuda(non_blocking=True)
+        years_to_event = years_to_event.cuda(non_blocking=True)
         event = event.cuda(non_blocking=True)
 
         # forward
         output = mlp(image, contralateral_image)
 
-        loss = CoxPHLoss()(output, duration, event)
+        loss = CoxPHLoss()(output, years_to_event, event)
 
         # compute the gradients
         optimizer.zero_grad()
@@ -319,7 +334,7 @@ def train(mlp, optimizer, loader, epoch):
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
 
         outputs += [output]
-        durations += [duration]
+        durations += [years_to_event]
         events += [event]
 
     # gather the stats from all processes
@@ -331,9 +346,9 @@ def train(mlp, optimizer, loader, epoch):
     outputs = torch.cat(outputs[:500])
     durations = torch.cat(durations[:500])
     events = torch.cat(events[:500])
-    dist.barrier()
+    # dist.barrier()
     # dist.all_reduce(outputs)
-    # dist.all_reduce(durations)
+    # dist.all_reduce(years_to_event)
     # dist.all_reduce(events)
     return (
         {k: meter.global_avg for k, meter in metric_logger.meters.items()},
@@ -348,7 +363,7 @@ def validate_network(
     val_loader,
     mlp,
     train_outputs,
-    train_durations,
+    train_years_to_event,
     train_events,
     output_dir,
 ):
@@ -362,23 +377,23 @@ def validate_network(
     for (
         image,
         contralateral_image,
-        duration,
+        years_to_event,
         event,
         study_id,
     ) in metric_logger.log_every(val_loader, 1, header):
         image = image.cuda(non_blocking=False)
         contralateral_image = contralateral_image.cuda(non_blocking=False)
-        duration = duration.cuda(non_blocking=False)
+        years_to_event = years_to_event.cuda(non_blocking=False)
         event = event.cuda(non_blocking=False)
 
         output = mlp(image, contralateral_image)
 
-        loss = CoxPHLoss()(output, duration, event)
+        loss = CoxPHLoss()(output, years_to_event, event)
 
         metric_logger.update(loss=loss.item())
 
         outputs += [output]
-        durations += [duration]
+        durations += [years_to_event]
         events += [event]
 
     outputs = torch.cat(outputs)
@@ -387,7 +402,7 @@ def validate_network(
 
     surv = predict_coxph_surv(
         train_outputs,
-        train_durations,
+        train_years_to_event,
         train_events,
         outputs,
         output_dir=output_dir,
@@ -522,6 +537,12 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--epochs", default=100, type=int, help="Number of epochs of training."
+    )
+    parser.add_argument(
+        "--patience",
+        default=5,
+        type=int,
+        help="How many epochs to wait before stopping when val loss is not improving",
     )
     parser.add_argument(
         "--lr",

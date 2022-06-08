@@ -170,7 +170,7 @@ def get_args_parser():
     )
     parser.add_argument(
         "--patience",
-        default=15,
+        default=8,
         type=int,
         help="How many epochs to wait before stopping when loss is not improving",
     )
