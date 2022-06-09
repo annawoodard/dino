@@ -303,19 +303,7 @@ def train_dino(gpu, args):
     utils.fix_random_seeds(args.seed)
     cudnn.benchmark = True
 
-    logging.basicConfig(
-        format="%(asctime)s|%(levelname)s|%(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-    logger = logging.getLogger()
-    fh = logging.FileHandler(os.path.join(args.output_dir, "pretrain.log"))
-    if args.rank == 0:
-        logger.setLevel(logging.INFO)
-        log_code_state(args.output_dir)
-    else:
-        logger.setLevel(logging.ERROR)
-    logger.addHandler(fh)
-
+    logger = utils.setup_logging(args.output_dir, "pretrain", args.rank)
     logger.info("git:\n  {}\n".format(utils.get_sha()))
     logger.info(
         "\n".join("%s: %s" % (k, str(v)) for k, v in sorted(dict(vars(args)).items()))

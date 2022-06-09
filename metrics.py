@@ -5,7 +5,6 @@ from sklearn import metrics
 
 import torch
 
-from torchmetrics import Metric
 from pycox.models.coxph import compute_baseline_hazards, output2surv
 from pycox.evaluation import EvalSurv
 

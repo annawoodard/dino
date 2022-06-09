@@ -17,6 +17,7 @@ import argparse
 import json
 import logging
 from pathlib import Path
+from torch.utils.tensorboard import SummaryWriter
 
 import torch
 from torch import nn
@@ -38,14 +39,24 @@ def eval_finetune(gpu, args):
     args.rank = gpu
     utils.init_distributed_mode(args)
     utils.fix_random_seeds(args.seed)
-    logger = utils.setup_logging(args.rank, args.output_dir, "finetune")
-    logger.info("git:\n  {}\n".format(utils.get_sha()))
+    logger = utils.setup_logging(
+        args.output_dir, f"ft_rank_{args.rank}", rank=args.rank
+    )
+    utils.log_code_state(args.output_dir)
+    if utils.is_main_process():
+        tag = "_".join(args.output_dir.split()[-3:])
+        log_writer = SummaryWriter(
+            # os.path.join("logs", tag, f"fold_{fold}" if fold is not None else "test")
+            os.path.join("logs", tag, f"rank_{args.rank}")
+        )
     logger.info(
         "\n".join("%s: %s" % (k, str(v)) for k, v in sorted(dict(vars(args)).items()))
     )
     cudnn.benchmark = True
-
-    in_chans = utils.get_input_channels(args.pretrained_weights)
+    state_dict = torch.load(args.pretrained_weights, map_location="cpu")
+    in_chans = state_dict.pop("in_chans")
+    fit_metadata = state_dict.pop("fit_metadata")
+    test_metadata = state_dict.pop("test_metadata")
 
     # ============ building network ... ============
     # if the network is a Vision Transformer (i.e. vit_tiny, vit_small, vit_base)
@@ -60,8 +71,7 @@ def eval_finetune(gpu, args):
         logger.error(f"Unknow architecture: {args.arch}")
     model.cuda()
     model.eval()
-    # load weights to evaluate
-    fit_metadata, test_metadata = utils.load_pretrained_checkpoint(
+    utils.load_pretrained_checkpoint(
         model, args.pretrained_weights, args.checkpoint_key
     )
     logger.info(f"Model {args.arch} built.")
@@ -190,6 +200,8 @@ def eval_finetune(gpu, args):
     for i, (train_loader, val_loader) in enumerate(fit_loaders):
         if i < fold:
             continue
+        if i > args.max_fold:
+            break
         early_stopping = utils.EarlyStopping(patience=args.patience)
         for epoch in range(start_epoch, args.epochs):
             train_loader.sampler.set_epoch(epoch)
@@ -197,6 +209,9 @@ def eval_finetune(gpu, args):
             train_stats, train_outputs, train_years_to_event, train_events = train(
                 mlp, optimizer, train_loader, epoch
             )
+            if utils.is_main_process():
+                for key, value in train_stats.items():
+                    log_writer.add_scalar(f"train/{key}", value, epoch)
             scheduler.step()
 
             log_stats = {
@@ -230,6 +245,9 @@ def eval_finetune(gpu, args):
                             train_events,
                             args.output_dir,
                         )
+                        if utils.is_main_process():
+                            for key, value in val_stats.items():
+                                log_writer.add_scalar(f"val/{key}", value, epoch)
                         early_stopping(
                             val_stats["loss"]
                         )  # TODO stop on c index? It is noisier than loss
@@ -322,6 +340,8 @@ def train(mlp, optimizer, loader, epoch):
         output = mlp(image, contralateral_image)
 
         loss = CoxPHLoss()(output, years_to_event, event)
+        if torch.isnan(loss):
+            raise RuntimeError("Loss is NaN!")
 
         # compute the gradients
         optimizer.zero_grad()
@@ -389,6 +409,8 @@ def validate_network(
         output = mlp(image, contralateral_image)
 
         loss = CoxPHLoss()(output, years_to_event, event)
+        if torch.isnan(loss):
+            raise RuntimeError("Loss is NaN!")
 
         metric_logger.update(loss=loss.item())
 
@@ -409,10 +431,10 @@ def validate_network(
         sample=1.0,
     )
     c_index = concordance_index(surv, durations, events)
-    aucs = auc(surv, durations, events)
+    # aucs = auc(surv, durations, events)
     metric_logger.update(c_index=c_index)
-    for key, value in aucs.items():
-        metric_logger.update(key=value)
+    # for key, value in aucs.items():
+    #     metric_logger.update({key: value})
 
     logger.info(
         "* c-index {c_index:.3f} loss {losses.global_avg:.3f}".format(
@@ -594,7 +616,10 @@ if __name__ == "__main__":
         "--val_start", default=0, type=int, help="Start validating at epoch VAL_START"
     )
     parser.add_argument(
-        "--folds", default=6, type=int, help="Number of validation folds"
+        "--folds", default=6, type=int, help="Number of validation folds for splitting"
+    )
+    parser.add_argument(
+        "--max_fold", default=1, type=int, help="Only run MAX_FOLD folds"
     )
     parser.add_argument(
         "--output_dir", default=".", help="Path to save logs and checkpoints"

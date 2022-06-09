@@ -34,8 +34,21 @@ import torch
 from torch import nn
 import torch.distributed as dist
 from PIL import ImageFilter, ImageOps
+import git
 
 logger = logging.getLogger()
+
+
+def log_code_state(dir):
+    logger = logging.getLogger()
+    repo = git.Repo(search_parent_directories=True)
+    commit = repo.head.commit
+    logger.info(
+        f"Latest commit: {commit.hexsha}\nauthor: {commit.author}\ndate: {commit.committed_date}\nmessage: {commit.message}"
+    )
+    os.makedirs(dir, exist_ok=True)
+    with open(os.path.join(dir, "code.diff"), "w") as f:
+        print(repo.git.diff(), file=f)
 
 
 class GaussianBlur(object):
@@ -88,16 +101,10 @@ def get_unused_local_port():
     return port
 
 
-def get_input_channels(checkpoint):
-    state_dict = torch.load(checkpoint, map_location="cpu")
-    return state_dict.pop("in_chans")
-
-
 def load_pretrained_checkpoint(model, pretrained_weights, checkpoint_key):
     state_dict = torch.load(pretrained_weights, map_location="cpu")
-    fit_metadata = state_dict.pop("fit_metadata")
-    test_metadata = state_dict.pop("test_metadata")
-    state_dict.pop("in_chans")
+    for key in ["in_chans", "fit_metadata", "test_metadata"]:
+        state_dict.pop(key)
     if checkpoint_key is not None and checkpoint_key in state_dict:
         logger.info(f"Take key {checkpoint_key} in provided checkpoint dict")
         state_dict = state_dict[checkpoint_key]
@@ -111,8 +118,6 @@ def load_pretrained_checkpoint(model, pretrained_weights, checkpoint_key):
             pretrained_weights, msg
         )
     )
-
-    return fit_metadata, test_metadata
 
 
 def load_pretrained_linear_weights(linear_classifier, model_name, patch_size):
@@ -202,6 +207,9 @@ def restart_from_checkpoint(ckp_path, restore_objects=None, **kwargs):
         for var_name in restore_objects:
             if var_name in checkpoint:
                 restore_objects[var_name] = checkpoint[var_name]
+                logger.info(
+                    "=> loaded '{}' from checkpoint '{}' ".format(var_name, ckp_path)
+                )
 
 
 def cosine_scheduler(
@@ -496,19 +504,24 @@ def save_on_master(*args, **kwargs):
         torch.save(*args, **kwargs)
 
 
-def setup_logging(rank, output_dir, tag):
-    logging.basicConfig(
-        format="%(asctime)s|%(levelname)s|%(message)s",
+def setup_logging(output_dir, tag, rank=None):
+    formatter = logging.Formatter(
+        fmt="%(asctime)s|%(levelname)s|%(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
-    logger = logging.getLogger()
-    fh = logging.FileHandler(os.path.join(output_dir, tag + ".log"))
+    console = logging.StreamHandler()
+    console.setFormatter(formatter)
 
-    if rank == 0:
-        logger.setLevel(logging.INFO)
-    else:
-        logger.setLevel(logging.ERROR)
+    fh = logging.FileHandler(os.path.join(output_dir, tag + ".log"))
+    fh.setFormatter(formatter)
+
+    logger = logging.getLogger()
+    logger.addHandler(console)
     logger.addHandler(fh)
+
+    logger.setLevel(logging.INFO)
+    if (rank != None) and (rank != 0):
+        logger.setLevel(logging.ERROR)
 
     return logger
 
