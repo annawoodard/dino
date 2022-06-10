@@ -39,6 +39,19 @@ import git
 logger = logging.getLogger()
 
 
+def save(obj, path):
+    """Wrapper for torch.save that adds a 'partial' tag
+    until writing is complete. This protects us from loading
+    checkpoints which were interrupted during writing.
+
+    Args:
+        obj (Any): Object to save.
+        path (str | PathLike | BinaryIO | IO[bytes): Path to save.
+    """
+    torch.save(obj, path + ".partial")
+    os.rename(path + ".partial", path)
+
+
 def log_code_state(dir):
     logger = logging.getLogger()
     repo = git.Repo(search_parent_directories=True)

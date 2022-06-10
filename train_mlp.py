@@ -175,7 +175,7 @@ def train_mlp(gpu, result_queue, fold_queue, in_chans, args):
                 train_durations,
                 train_events,
                 train_study_ids,
-            ) = extraction_pipeline(model, train_loader, args, train_serialize_path)
+            ) = extract_and_save(model, train_loader, args, train_serialize_path)
         try:
             (
                 test_features,
@@ -189,7 +189,7 @@ def train_mlp(gpu, result_queue, fold_queue, in_chans, args):
                 test_durations,
                 test_events,
                 test_study_ids,
-            ) = extraction_pipeline(model, test_loader, args, test_serialize_path)
+            ) = extract_and_save(model, test_loader, args, test_serialize_path)
         mlp = BilateralMLP(
             train_features.shape[-1],
             hidden_features=512,
@@ -324,7 +324,7 @@ def train_mlp(gpu, result_queue, fold_queue, in_chans, args):
                     args.batch_size_per_gpu,
                 )
                 logger.info(
-                    f"Concordance index of the model trained with (train + val) datasets on the {len(test_features.shape[0])} test exams: {test_stats['c_index']:.3f}"
+                    f"Concordance index of the model trained with (train + val) datasets on the {test_features.shape[0]} test exams: {test_stats['c_index']:.3f}"
                 )
                 for key, value in test_stats.items():
                     log_writer.add_scalar(f"test/{key}", value, epoch)
@@ -349,7 +349,7 @@ def train_mlp(gpu, result_queue, fold_queue, in_chans, args):
         result_queue.put({fold: test_stats if fold == None else val_stats})
 
 
-def extraction_pipeline(model, loader, args, path):
+def extract_and_save(model, loader, args, path):
     (features, durations, events, study_ids,) = extract_features_and_labels(
         model,
         loader,

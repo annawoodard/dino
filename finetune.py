@@ -45,10 +45,7 @@ def eval_finetune(gpu, args):
     utils.log_code_state(args.output_dir)
     if utils.is_main_process():
         tag = "_".join(args.output_dir.split()[-3:])
-        log_writer = SummaryWriter(
-            # os.path.join("logs", tag, f"fold_{fold}" if fold is not None else "test")
-            os.path.join("logs", tag, f"rank_{args.rank}")
-        )
+        log_writer = SummaryWriter(os.path.join(args.output_dir, "logs"))
     logger.info(
         "\n".join("%s: %s" % (k, str(v)) for k, v in sorted(dict(vars(args)).items()))
     )
@@ -231,8 +228,9 @@ def eval_finetune(gpu, args):
                     "test_loader": test_loader,
                     "fold": i,
                 }
-                torch.save(
-                    save_dict, os.path.join(args.output_dir, "checkpoint.pth.tar")
+                utils.save(
+                    save_dict,
+                    os.path.join(args.output_dir, "checkpoint.pth.tar"),
                 )
             if epoch % args.val_freq == 0 or epoch == args.epochs - 1:
                 if epoch >= args.val_start:
@@ -268,7 +266,7 @@ def eval_finetune(gpu, args):
                                 "test_loader": test_loader,
                                 "fold": i,
                             }
-                            torch.save(
+                            utils.save(
                                 save_dict,
                                 os.path.join(
                                     args.output_dir, "best_checkpoint.pth.tar"
