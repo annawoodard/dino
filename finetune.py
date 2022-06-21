@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
+import sys
 import torch.multiprocessing as mp
 import argparse
 import json
@@ -34,29 +35,7 @@ from pycox.models.loss import CoxPHLoss
 from metrics import predict_coxph_surv, concordance_index, auc
 
 
-def eval_finetune(gpu, args):
-    args.gpu = gpu
-    args.rank = gpu
-    utils.init_distributed_mode(args)
-    utils.fix_random_seeds(args.seed)
-    logger = utils.setup_logging(
-        args.output_dir, f"ft_rank_{args.rank}", rank=args.rank
-    )
-    utils.log_code_state(args.output_dir)
-    if utils.is_main_process():
-        tag = "_".join(args.output_dir.split()[-3:])
-        log_writer = SummaryWriter(os.path.join(args.output_dir, "logs"))
-    logger.info(
-        "\n".join("%s: %s" % (k, str(v)) for k, v in sorted(dict(vars(args)).items()))
-    )
-    cudnn.benchmark = True
-    state_dict = torch.load(args.pretrained_weights, map_location="cpu")
-    in_chans = state_dict.pop("in_chans")
-    fit_metadata = state_dict.pop("fit_metadata")
-    test_metadata = state_dict.pop("test_metadata")
-
-    # ============ building network ... ============
-    # if the network is a Vision Transformer (i.e. vit_tiny, vit_small, vit_base)
+def initialize(logger, in_chans, args, ignore_checkpoints=False):
     if args.arch in vits.__dict__.keys():
         model = vits.__dict__[args.arch](
             patch_size=args.patch_size, num_classes=0, in_chans=in_chans
@@ -83,38 +62,11 @@ def eval_finetune(gpu, args):
         drop=0.0,
         avgpool=args.avgpool_patchtokens,
     )
+    print(mlp)
     mlp = mlp.cuda()
     mlp = nn.parallel.DistributedDataParallel(
         mlp, device_ids=[args.gpu], find_unused_parameters=True
     )
-
-    # ============ preparing data ... ============
-    val_transform = pth_transforms.Compose(
-        [
-            pth_transforms.Resize(256, interpolation=3),
-            pth_transforms.CenterCrop(224),
-            pth_transforms.ToTensor(),
-            pth_transforms.Normalize(CHIMEC_MEAN, CHIMEC_STD),
-        ]
-    )
-    train_transform = pth_transforms.Compose(
-        [
-            pth_transforms.Resize(448, interpolation=3),
-            pth_transforms.RandomResizedCrop(224),
-            pth_transforms.RandomHorizontalFlip(),
-            pth_transforms.ToTensor(),
-            pth_transforms.Normalize(CHIMEC_MEAN, CHIMEC_STD),
-        ]
-    )
-    if args.evaluate:
-        ## TODO add train outputs/durations/events to checkpoint; these are needed for evaluation
-        raise NotImplementedError
-        utils.load_pretrained_linear_weights(mlp, args.arch, args.patch_size)
-        test_stats = validate_network(test_loader, mlp, c_index)
-        logger.info(
-            f"Accuracy of the network on the {len(test_dataset)} test images: {test_stats['acc1']:.1f}%"
-        )
-        return
 
     # set optimizer
     optimizer = torch.optim.SGD(
@@ -134,23 +86,103 @@ def eval_finetune(gpu, args):
         "epoch": 0,
         "best_c_index": 0.0,
         "fold": 0,
-        "fit_loader": None,
-        "test_loader": None,
     }
-    utils.restart_from_checkpoint(
-        os.path.join(args.output_dir, "checkpoint.pth.tar"),
-        restore_objects=to_restore,
-        state_dict=mlp,
-        optimizer=optimizer,
-        scheduler=scheduler,
+    if not ignore_checkpoints:
+        utils.restart_from_checkpoint(
+            os.path.join(args.output_dir, "checkpoint.pth.tar"),
+            restore_objects=to_restore,
+            state_dict=mlp,
+            optimizer=optimizer,
+            scheduler=scheduler,
+        )
+
+    return mlp, optimizer, scheduler, to_restore
+
+
+def finetune(gpu, args):
+    args.gpu = gpu
+    args.rank = gpu
+    utils.init_distributed_mode(args)
+    utils.fix_random_seeds(args.seed)
+    logger = utils.setup_logging(
+        args.output_dir, f"ft_rank_{args.rank}", rank=args.rank
     )
-    start_epoch = to_restore["epoch"]
-    best_c_index = to_restore["best_c_index"]
-    fit_loaders = to_restore["fit_loader"]
-    test_loader = to_restore["test_loader"]
-    fold = to_restore["fold"]
+    utils.log_code_state(args.output_dir)
+    logger.info("called with: %s", " ".join(sys.argv))
+    logger.info(
+        "\n".join("%s: %s" % (k, str(v)) for k, v in sorted(dict(vars(args)).items()))
+    )
+    cudnn.benchmark = True
+    state_dict = torch.load(args.pretrained_weights, map_location="cpu")
+    in_chans = state_dict.pop("in_chans")
+    fit_metadata = state_dict.pop("fit_metadata")
+    test_metadata = state_dict.pop("test_metadata")
+    fit_loaders = None
+    test_loader = None
+
+    if args.evaluate:
+        ## TODO add train outputs/durations/events to checkpoint; these are needed for evaluation
+        raise NotImplementedError
+        utils.load_pretrained_linear_weights(mlp, args.arch, args.patch_size)
+        test_stats = validate_network(test_loader, mlp, c_index)
+        logger.info(
+            f"Accuracy of the network on the {len(test_dataset)} test images: {test_stats['acc1']:.1f}%"
+        )
+        return
+
+    if (args.loaders is not None) or os.path.isfile(
+        os.path.join(args.output_dir, "loaders.pth.tar")
+    ):
+        if args.loaders is not None:
+            cpt = torch.load(args.loaders, map_location="cpu")
+        elif os.path.isfile(os.path.join(args.output_dir, "loaders.pth.tar")):
+            cpt = torch.load(os.path.join(args.output_dir, "loaders.pth.tar"))
+        test_loader = torch.utils.data.DataLoader(
+            cpt["test_loader"].dataset,
+            batch_size=args.batch_size_per_gpu,
+            num_workers=0,
+            pin_memory=True,
+        )
+        fit_loaders = [
+            (
+                torch.utils.data.DataLoader(
+                    train_loader.dataset,
+                    sampler=torch.utils.data.distributed.DistributedSampler(
+                        train_loader.dataset
+                    ),
+                    batch_size=args.batch_size_per_gpu,
+                    num_workers=args.num_workers,
+                    pin_memory=True,
+                    drop_last=True,
+                ),
+                torch.utils.data.DataLoader(
+                    val_loader.dataset,
+                    batch_size=args.batch_size_per_gpu,
+                    num_workers=0,
+                    pin_memory=True,
+                ),
+            )
+            for train_loader, val_loader in cpt["fit_loaders"]
+        ]
 
     if fit_loaders is None:
+        val_transform = pth_transforms.Compose(
+            [
+                pth_transforms.Resize(256, interpolation=3),
+                pth_transforms.CenterCrop(224),
+                pth_transforms.ToTensor(),
+                pth_transforms.Normalize(CHIMEC_MEAN, CHIMEC_STD),
+            ]
+        )
+        train_transform = pth_transforms.Compose(
+            [
+                pth_transforms.Resize(448, interpolation=3),
+                pth_transforms.RandomResizedCrop(224),
+                pth_transforms.RandomHorizontalFlip(),
+                pth_transforms.ToTensor(),
+                pth_transforms.Normalize(CHIMEC_MEAN, CHIMEC_STD),
+            ]
+        )
         fit_datasets, test_dataset = get_datasets(
             args.prescale,
             train_transform,
@@ -188,18 +220,35 @@ def eval_finetune(gpu, args):
             num_workers=0,
             pin_memory=True,
         )
-    logger.info(f"Data loaded with {len(test_dataset)} test exams")
-    for i, (train_dataset, val_dataset) in enumerate(fit_datasets):
+        torch.save(
+            {
+                "fit_loaders": fit_loaders,
+                "test_loader": test_loader,
+            },
+            os.path.join(args.output_dir, "loaders.pth.tar"),
+        )
+    logger.info(f"Data loaded with {len(test_loader.dataset)} test exams")
+    for i, (train_loader, val_loader) in enumerate(fit_loaders):
         logger.info(
-            f"Fold {i}: {len(train_dataset)} training exams and {len(val_dataset)} val exams"
+            f"Fold {i}: {len(train_loader.dataset)} training exams and {len(val_loader.dataset)} val exams"
         )
 
     for i, (train_loader, val_loader) in enumerate(fit_loaders):
-        if i < fold:
-            continue
-        if i > args.max_fold:
-            break
+        if args.fold is None:
+            if i < last_completed_fold:
+                continue
+        else:
+            if i != args.fold:
+                continue
+        if utils.is_main_process():
+            log_writer = SummaryWriter(
+                os.path.join(args.output_dir, "logs", f"fold_{i}")
+            )
         early_stopping = utils.EarlyStopping(patience=args.patience)
+        mlp, optimizer, scheduler, to_restore = initialize(logger, in_chans, args)
+        start_epoch = to_restore["epoch"]
+        best_c_index = to_restore["best_c_index"]
+        last_completed_fold = to_restore["fold"]
         for epoch in range(start_epoch, args.epochs):
             train_loader.sampler.set_epoch(epoch)
 
@@ -247,7 +296,7 @@ def eval_finetune(gpu, args):
                             for key, value in val_stats.items():
                                 log_writer.add_scalar(f"val/{key}", value, epoch)
                         early_stopping(
-                            val_stats["loss"]
+                            val_stats["loss"], val_stats["c_index"]
                         )  # TODO stop on c index? It is noisier than loss
                         if early_stopping.early_stop:
                             break
@@ -256,22 +305,6 @@ def eval_finetune(gpu, args):
                         )
                         if best_c_index < val_stats["c_index"]:
                             best_c_index = val_stats["c_index"]
-                            save_dict = {
-                                "epoch": epoch + 1,
-                                "state_dict": mlp.state_dict(),
-                                "optimizer": optimizer.state_dict(),
-                                "scheduler": scheduler.state_dict(),
-                                "best_c_index": best_c_index,
-                                "fit_loaders": fit_loaders,
-                                "test_loader": test_loader,
-                                "fold": i,
-                            }
-                            utils.save(
-                                save_dict,
-                                os.path.join(
-                                    args.output_dir, "best_checkpoint.pth.tar"
-                                ),
-                            )
                         logger.info(f"Max c-index so far: {best_c_index:.3f}")
                         log_stats = {
                             **{k: v for k, v in log_stats.items()},
@@ -281,36 +314,73 @@ def eval_finetune(gpu, args):
                             "a"
                         ) as f:
                             f.write(json.dumps(log_stats) + "\n")
-        # FIXME do not test every fold, need to stop and retrain on tuned HPs with no val
-        utils.restart_from_checkpoint(
-            os.path.join(args.output_dir, "best_checkpoint.pth.tar"),
-            state_dict=mlp,
-            optimizer=optimizer,
-            scheduler=scheduler,
+
+    mlp, optimizer, scheduler, _ = initialize(
+        logger, in_chans, args, ignore_checkpoints=True
+    )
+    # for the test dataset, we train with all training data
+    full_train_dataset = train_loader.dataset + val_loader.dataset
+    full_train_loader = (
+        torch.utils.data.DataLoader(
+            full_train_dataset,
+            sampler=torch.utils.data.distributed.DistributedSampler(full_train_dataset),
+            batch_size=args.batch_size_per_gpu,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            drop_last=True,
+        ),
+    )
+    if utils.is_main_process():
+        log_writer = SummaryWriter(os.path.join(args.output_dir, "logs", f"test"))
+
+    for epoch in range(0, args.epochs):
+        train_stats, train_outputs, train_years_to_event, train_events = train(
+            mlp, optimizer, full_train_loader, epoch
         )
         if utils.is_main_process():
-            test_stats = validate_network(
-                test_loader,
-                mlp,
-                train_outputs,
-                train_years_to_event,
-                train_events,
-                args.output_dir,
-            )
-            logger.info(
-                f"Concordance index of the best-performing network in the validation set on the {len(test_dataset)} test exams: {test_stats['c_index']:.3f}"
-            )
-            log_stats = {
-                **{k: v for k, v in log_stats.items()},
-                **{f"test_{k}": v for k, v in test_stats.items()},
-            }
-            with (Path(args.output_dir) / "test_log.txt").open("a") as f:
-                f.write(json.dumps(log_stats) + "\n")
+            for key, value in train_stats.items():
+                log_writer.add_scalar(f"train/{key}", value, epoch)
+        scheduler.step()
 
-    logger.info(
-        f"Training of the supervised MLP on frozen features completed.\n"
-        f"Best validation concordance index: {best_c_index:.3f}"
-    )
+        log_stats = {
+            **{f"train_{k}": v for k, v in train_stats.items()},
+            "epoch": epoch,
+        }
+        if utils.is_main_process():
+            with (Path(args.output_dir) / f"fold_{i}_train_log.txt").open("a") as f:
+                f.write(json.dumps(log_stats) + "\n")
+            save_dict = {
+                "epoch": epoch + 1,
+                "state_dict": mlp.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "train_loader": full_train_loader,
+                "test_loader": test_loader,
+            }
+            utils.save(
+                save_dict,
+                os.path.join(args.output_dir, "full_checkpoint.pth.tar"),
+            )
+    if utils.is_main_process():
+        test_stats = validate_network(
+            test_loader,
+            mlp,
+            train_outputs,
+            train_years_to_event,
+            train_events,
+            args.output_dir,
+        )
+        logger.info(
+            f"Concordance index of the network trained on the full training dataset in the {len(test_dataset)} test exams: {test_stats['c_index']:.3f}"
+        )
+        log_stats = {
+            **{k: v for k, v in log_stats.items()},
+            **{f"test_{k}": v for k, v in test_stats.items()},
+        }
+        with (Path(args.output_dir) / "test_log.txt").open("a") as f:
+            f.write(json.dumps(log_stats) + "\n")
+
+    logger.info(f"Training of the supervised MLP on frozen features completed.\n")
 
 
 def train(mlp, optimizer, loader, epoch):
@@ -560,7 +630,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--patience",
-        default=5,
+        default=10,
         type=int,
         help="How many epochs to wait before stopping when val loss is not improving",
     )
@@ -614,13 +684,14 @@ if __name__ == "__main__":
         "--val_start", default=0, type=int, help="Start validating at epoch VAL_START"
     )
     parser.add_argument(
-        "--folds", default=6, type=int, help="Number of validation folds for splitting"
+        "--folds", default=5, type=int, help="Number of validation folds for splitting"
     )
-    parser.add_argument(
-        "--max_fold", default=1, type=int, help="Only run MAX_FOLD folds"
-    )
+    parser.add_argument("--fold", default=None, type=int, help="Only run this fold")
     parser.add_argument(
         "--output_dir", default=".", help="Path to save logs and checkpoints"
+    )
+    parser.add_argument(
+        "--loaders", default=None, help="Path to saved fit and test loaders"
     )
     parser.add_argument(
         "--evaluate",
@@ -649,7 +720,7 @@ if __name__ == "__main__":
     for fold in range(args.folds):
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     mp.spawn(
-        eval_finetune,
+        finetune,
         nprocs=len(args.devices),
         args=(args,),
     )

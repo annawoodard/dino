@@ -1,28 +1,16 @@
-# Copyright (c) Facebook, Inc. and its affiliates.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 import argparse
 import json
 import logging
+import numpy as np
 import multiprocessing
 import os
 from pathlib import Path
 
 import torch
+import wandb
 
 torch.autograd.set_detect_anomaly(True)
 import torch.backends.cudnn as cudnn
-import torch.distributed as dist
 import torch.multiprocessing as mp
 from maicara.data.constants import CHIMEC_MEAN, CHIMEC_STD
 from pycox.models.loss import CoxPHLoss
@@ -32,7 +20,8 @@ from torchvision import transforms as pth_transforms
 
 import utils
 import vision_transformer as vits
-from chimec import get_datasets
+from chimec import get_datasets, log_summary
+from chimec import ChiMECFinetuningTrainingDataset
 from metrics import auc, concordance_index, predict_coxph_surv
 
 
@@ -40,11 +29,14 @@ from metrics import auc, concordance_index, predict_coxph_surv
 def extract_features_and_labels(
     encoder, data_loader, multiscale=False, avgpool=False, n_last_blocks=4
 ):
+    logger = logging.getLogger()
+    logger.info(f"Extracting features for {len(data_loader.dataset)} samples")
     metric_logger = utils.MetricLogger(delimiter="  ")
     features = []
     years_to_events = []
     events = []
     study_ids = []
+
     for (
         image,
         contralateral_image,
@@ -111,10 +103,10 @@ def train_mlp(gpu, result_queue, fold_queue, in_chans, args):
     torch.cuda.set_device(gpu)
     utils.fix_random_seeds(args.seed)
     cudnn.benchmark = True
-    tag = "_".join(args.output_dir.split()[-3:])
     while fold_queue.qsize() > 0:
         fold = fold_queue.get()
         logger = utils.setup_logging(args.output_dir, f"train_mlp_{fold}")
+        logger.info(f"Processing fold {fold} on gpu {gpu}")
         utils.log_code_state(args.output_dir)
         logger.info(
             "\n".join(
@@ -122,7 +114,9 @@ def train_mlp(gpu, result_queue, fold_queue, in_chans, args):
             )
         )
         log_writer = SummaryWriter(
-            os.path.join("logs", tag, f"fold_{fold}" if fold is not None else "test")
+            os.path.join(
+                args.output_dir, "logs", "test" if fold == None else f"fold_{fold}"
+            )
         )
 
         train_serialize_path = os.path.join(
@@ -131,13 +125,31 @@ def train_mlp(gpu, result_queue, fold_queue, in_chans, args):
         test_serialize_path = os.path.join(
             os.path.join(args.features_dir, f"test_features_fold_{fold}.pth")
         )
-        data_loaders = torch.load(os.path.join(args.features_dir, "loaders.pth.tar"))
+        datasets = torch.load(os.path.join(args.features_dir, "datasets.pth.tar"))
+        fit_datasets = datasets["fit_datasets"]
+        test_dataset = datasets["test_dataset"]
+        # before evaluating the testing dataset we train with all fit data (train + val)
+        train_dataset, val_dataset = fit_datasets[fold if fold is not None else 0]
+        log_summary("train", train_dataset.metadata)
+        log_summary("val", val_dataset.metadata)
+        if args.fold != None:
+            train_dataset, val_dataset = fit_datasets[args.fold]
 
-        # this is the final iteration; we train with all fit data (train + val)
         if fold == None:
-            test_loader = data_loaders["test_loader"]
-            last_train_loader, last_val_loader = fit_loaders[-1]
-            train_dataset = last_train_loader.dataset + last_val_loader.dataset
+            train_loader = torch.utils.data.DataLoader(
+                train_dataset + val_dataset,
+                batch_size=args.batch_size_per_gpu,
+                num_workers=args.num_workers,
+                pin_memory=True,
+                drop_last=True,
+            )
+            test_loader = torch.utils.data.DataLoader(
+                test_dataset,
+                batch_size=args.batch_size_per_gpu,
+                num_workers=0,
+                pin_memory=True,
+            )
+        else:
             train_loader = torch.utils.data.DataLoader(
                 train_dataset,
                 batch_size=args.batch_size_per_gpu,
@@ -145,15 +157,19 @@ def train_mlp(gpu, result_queue, fold_queue, in_chans, args):
                 pin_memory=True,
                 drop_last=True,
             )
-        else:
-            fit_loaders = data_loaders["fit_loaders"]
-            train_loader, test_loader = fit_loaders[fold]
+            test_loader = torch.utils.data.DataLoader(
+                val_dataset,
+                batch_size=args.batch_size_per_gpu,
+                num_workers=0,
+                pin_memory=True,
+            )
+
         if args.arch in vits.__dict__.keys():
             model = vits.__dict__[args.arch](
                 patch_size=args.patch_size, num_classes=0, in_chans=in_chans
             )
         else:
-            logger.error(f"Unknow architecture: {args.arch}")
+            logger.error(f"Unknown architecture: {args.arch}")
 
         model.cuda()
         model.eval()
@@ -190,6 +206,9 @@ def train_mlp(gpu, result_queue, fold_queue, in_chans, args):
                 test_events,
                 test_study_ids,
             ) = extract_and_save(model, test_loader, args, test_serialize_path)
+        if args.save_features_and_exit:
+            continue
+        del model
         mlp = BilateralMLP(
             train_features.shape[-1],
             hidden_features=512,
@@ -197,6 +216,7 @@ def train_mlp(gpu, result_queue, fold_queue, in_chans, args):
             act_layer=nn.GELU,
             drop=0.0,
         )
+        print(mlp)
         mlp = mlp.cuda()
 
         if args.evaluate:
@@ -222,29 +242,7 @@ def train_mlp(gpu, result_queue, fold_queue, in_chans, args):
         )
         best_c_index = 0.0
 
-        # # Optionally resume from a checkpoint
-        # to_restore = {
-        #     "epoch": 0,
-        #     "best_c_index": 0.0,
-        #     "fold": 0,
-        #     "fit_loader": None,
-        #     "test_loader": None,
-        # }
-        # utils.restart_from_checkpoint(
-        #     os.path.join(args.output_dir, "checkpoint.pth.tar"),
-        #     restore_objects=to_restore,
-        #     state_dict=mlp,
-        #     optimizer=optimizer,
-        #     scheduler=scheduler,
-        # )
-        # start_epoch = to_restore["epoch"]
-        # best_c_index = to_restore["best_c_index"]
-        # fit_loaders = to_restore["fit_loader"]
-        # test_loader = to_restore["test_loader"]
-        # fold = to_restore["fold"]
-
         early_stopping = utils.EarlyStopping(patience=args.patience)
-        # for epoch in range(start_epoch, args.epochs):
         for epoch in range(0, args.epochs):
             train_stats, train_outputs = train(
                 mlp,
@@ -265,19 +263,8 @@ def train_mlp(gpu, result_queue, fold_queue, in_chans, args):
             }
             with (Path(args.output_dir) / f"fold_{fold}_train_log.txt").open("a") as f:
                 f.write(json.dumps(log_stats) + "\n")
-            # save_dict = {
-            #     "epoch": epoch + 1,
-            #     "state_dict": mlp.state_dict(),
-            #     "optimizer": optimizer.state_dict(),
-            #     "scheduler": scheduler.state_dict(),
-            #     "best_c_index": best_c_index,
-            #     "fit_loaders": fit_loaders,
-            #     "test_loader": test_loader,
-            #     "fold": i,
-            # }
-            # torch.save(save_dict, os.path.join(args.output_dir, "checkpoint.pth.tar"))
-            if epoch % args.val_freq == 0 or epoch == args.epochs - 1:
-                if (epoch >= args.val_start) and (fold != None):
+            if fold != None:
+                if (epoch % args.val_freq == 0) or (epoch == args.epochs - 1):
                     val_stats = validate_network(
                         test_features,
                         test_durations,
@@ -292,54 +279,50 @@ def train_mlp(gpu, result_queue, fold_queue, in_chans, args):
 
                     for key, value in val_stats.items():
                         log_writer.add_scalar(f"val/{key}", value, epoch)
-                    early_stopping(
-                        val_stats["loss"]
-                    )  # TODO stop on c index? It is noisier than loss
-                    if early_stopping.early_stop:
+                    early_stopping(val_stats["loss"])
+                    if args.early_stop and early_stopping.early_stop:
                         break
                     logger.info(
                         f"Concordance index at epoch {epoch} of the network on the {len(test_features)} test images: {val_stats['c_index']:.3f}"
                     )
                     if best_c_index < val_stats["c_index"]:
                         best_c_index = val_stats["c_index"]
-                        logger.info(f"Max c-index so far: {best_c_index:.3f}")
-                        log_stats = {
-                            **{k: v for k, v in log_stats.items()},
-                            **{f"val_{k}": v for k, v in val_stats.items()},
-                        }
-                        with (Path(args.output_dir) / f"fold_{fold}_val_log.txt").open(
-                            "a"
-                        ) as f:
-                            f.write(json.dumps(log_stats) + "\n")
-            if fold == None:
-                test_stats = validate_network(
-                    test_features,
-                    test_durations,
-                    test_events,
-                    mlp,
-                    train_outputs[:500].cuda(),
-                    train_durations[:500].cuda(),
-                    train_events[:500].cuda(),
-                    args.output_dir,
-                    args.batch_size_per_gpu,
-                )
-                logger.info(
-                    f"Concordance index of the model trained with (train + val) datasets on the {test_features.shape[0]} test exams: {test_stats['c_index']:.3f}"
-                )
-                for key, value in test_stats.items():
-                    log_writer.add_scalar(f"test/{key}", value, epoch)
-                log_stats = {
-                    **{k: v for k, v in log_stats.items()},
-                    **{f"test_{k}": v for k, v in test_stats.items()},
-                }
-                with (Path(args.output_dir) / "test_log.txt").open("a") as f:
-                    f.write(json.dumps(log_stats) + "\n")
-                save_dict = {
-                    "state_dict": mlp.state_dict(),
-                }
-                torch.save(
-                    save_dict, os.path.join(args.output_dir, "checkpoint.pth.tar")
-                )
+                    logger.info(f"Max c-index so far: {best_c_index:.3f}")
+                    log_stats = {
+                        **{k: v for k, v in log_stats.items()},
+                        **{f"val_{k}": v for k, v in val_stats.items()},
+                    }
+                    with (Path(args.output_dir) / f"fold_{fold}_val_log.txt").open(
+                        "a"
+                    ) as f:
+                        f.write(json.dumps(log_stats) + "\n")
+        if fold == None:
+            test_stats = validate_network(
+                test_features,
+                test_durations,
+                test_events,
+                mlp,
+                train_outputs[:500].cuda(),
+                train_durations[:500].cuda(),
+                train_events[:500].cuda(),
+                args.output_dir,
+                args.batch_size_per_gpu,
+            )
+            logger.info(
+                f"Concordance index of the model trained with (train + val) datasets on the {test_features.shape[0]} test exams: {test_stats['c_index']:.3f}"
+            )
+            for key, value in test_stats.items():
+                log_writer.add_scalar(f"test/{key}", value, epoch)
+            log_stats = {
+                **{k: v for k, v in log_stats.items()},
+                **{f"test_{k}": v for k, v in test_stats.items()},
+            }
+            with (Path(args.output_dir) / "test_log.txt").open("a") as f:
+                f.write(json.dumps(log_stats) + "\n")
+            save_dict = {
+                "state_dict": mlp.state_dict(),
+            }
+            torch.save(save_dict, os.path.join(args.output_dir, "checkpoint.pth.tar"))
 
         logger.info(
             f"Training of the supervised MLP on frozen features completed.\n"
@@ -377,17 +360,16 @@ def train(mlp, optimizer, features, durations, events, epoch, batch_size):
     metric_logger.add_meter("lr", utils.SmoothedValue(window_size=1, fmt="{value:.6f}"))
     header = "Epoch: [{}]".format(epoch)
     num_samples = features.shape[0]
+    logger.info(f"Begin training on {num_samples} samples")
     outputs = []
-    for idx in metric_logger.log_every(range(0, num_samples, batch_size), 20, header):
-        batch_features = features[idx : min((idx + batch_size), num_samples), :].cuda(
-            non_blocking=True
-        )
-        batch_durations = durations[idx : min((idx + batch_size), num_samples)].cuda(
-            non_blocking=True
-        )
-        batch_events = events[idx : min((idx + batch_size), num_samples)].cuda(
-            non_blocking=True
-        )
+    lowers = np.arange(0, num_samples, batch_size)[:-1]
+    uppers = lowers + batch_size
+    # Merge last partial batch with previous batch; loss is undefined with no positive examples
+    uppers[-1] = num_samples
+    for lower, upper in metric_logger.log_every(list(zip(lowers, uppers)), 19, header):
+        batch_features = features[lower:upper, :].cuda(non_blocking=True)
+        batch_durations = durations[lower:upper].cuda(non_blocking=True)
+        batch_events = events[lower:upper].cuda(non_blocking=True)
 
         # forward
         output = mlp(batch_features)
@@ -436,16 +418,14 @@ def validate_network(
     outputs = []
     num_samples = features.shape[0]
     outputs = []
-    for idx in metric_logger.log_every(range(0, num_samples, batch_size), 20, header):
-        batch_features = features[idx : min((idx + batch_size), num_samples), :].cuda(
-            non_blocking=True
-        )
-        batch_durations = durations[idx : min((idx + batch_size), num_samples)].cuda(
-            non_blocking=True
-        )
-        batch_events = events[idx : min((idx + batch_size), num_samples)].cuda(
-            non_blocking=True
-        )
+    lowers = np.arange(0, num_samples, batch_size)[:-1]
+    uppers = lowers + batch_size
+    # Merge last partial batch with previous batch; loss is undefined with no positive examples
+    uppers[-1] = num_samples
+    for lower, upper in metric_logger.log_every(list(zip(lowers, uppers)), 20, header):
+        batch_features = features[lower:upper, :].cuda(non_blocking=True)
+        batch_durations = durations[lower:upper].cuda(non_blocking=True)
+        batch_events = events[lower:upper].cuda(non_blocking=True)
 
         output = mlp(batch_features)
 
@@ -530,6 +510,18 @@ if __name__ == "__main__":
         help="""Whether ot not to concatenate the global average pooled features to the [CLS] token.
         We typically set this to False for ViT-Small and to True with ViT-Base.""",
     )
+    parser.add_argument(
+        "--early_stop",
+        default=False,
+        type=utils.bool_flag,
+        help="""Enable early stopping.""",
+    )
+    parser.add_argument(
+        "--save_features_and_exit",
+        default=False,
+        type=utils.bool_flag,
+        help="""Just save features (useful if you are memory-bound and want to save features with a small batch size)""",
+    )
     parser.add_argument("--arch", default="vit_small", type=str, help="Architecture")
     parser.add_argument(
         "--patch_size", default=16, type=int, help="Patch resolution of the model."
@@ -551,7 +543,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--patience",
-        default=5,
+        default=10,
         type=int,
         help="How many epochs to wait before stopping when val loss is not improving",
     )
@@ -602,10 +594,13 @@ if __name__ == "__main__":
         "--val_freq", default=1, type=int, help="Epoch frequency for validation."
     )
     parser.add_argument(
+        "--fold", default=None, type=int, help="Fix all folds to fold FOLD."
+    )
+    parser.add_argument(
         "--val_start", default=0, type=int, help="Start validating at epoch VAL_START"
     )
     parser.add_argument(
-        "--folds", default=8, type=int, help="Number of validation folds"
+        "--folds", default=5, type=int, help="Number of validation folds"
     )
     parser.add_argument(
         "--output_dir", default=".", help="Path to save logs and checkpoints"
@@ -647,8 +642,7 @@ if __name__ == "__main__":
 
     logger = utils.setup_logging(args.output_dir, f"train_mlp")
 
-    if not os.path.isfile(os.path.join(args.features_dir, "loaders.pth.tar")):
-        # ============ preparing data ... ============
+    if not os.path.isfile(os.path.join(args.features_dir, "datasets.pth.tar")):
         val_transform = pth_transforms.Compose(
             [
                 pth_transforms.Resize(256, interpolation=3),
@@ -676,49 +670,18 @@ if __name__ == "__main__":
             args.folds,
             args.seed,
         )
-
-        fit_loaders = [
-            (
-                torch.utils.data.DataLoader(
-                    train_dataset,
-                    batch_size=args.batch_size_per_gpu,
-                    num_workers=args.num_workers,
-                    pin_memory=True,
-                    drop_last=True,
-                ),
-                torch.utils.data.DataLoader(
-                    val_dataset,
-                    batch_size=args.batch_size_per_gpu,
-                    num_workers=0,
-                    pin_memory=True,
-                ),
-            )
-            for train_dataset, val_dataset in fit_datasets
-        ]
-
-        test_loader = torch.utils.data.DataLoader(
-            test_dataset,
-            batch_size=args.batch_size_per_gpu,
-            num_workers=0,
-            pin_memory=True,
+        torch.save(
+            {"fit_datasets": fit_datasets, "test_dataset": test_dataset},
+            os.path.join(args.features_dir, "datasets.pth.tar"),
         )
+        logger.info(f"Data loaded with {len(test_dataset)} test exams")
         for i, (train_dataset, val_dataset) in enumerate(fit_datasets):
             logger.info(
                 f"Fold {i}: {len(train_dataset)} training exams and {len(val_dataset)} val exams"
             )
 
-        torch.save(
-            {
-                "fit_loaders": fit_loaders,
-                "test_loader": test_loader,
-            },
-            os.path.join(args.features_dir, "loaders.pth.tar"),
-        )
-        logger.info(f"Data loaded with {len(test_dataset)} test exams")
-
     # We may not have a matching number of folds and GPUs
-    # so use pool instead of mp.spawn
-    # and use a queue to make sure only one GPU is used at a time
+    # so use a queue and a while loop to process all folds
     manager = multiprocessing.Manager()
     result_queue = manager.Queue()
     fold_queue = manager.Queue()
@@ -736,3 +699,13 @@ if __name__ == "__main__":
     results = [result_queue.get() for i in range(result_queue.qsize())]
 
     torch.save(results, os.path.join(args.output_dir, "results.pth.tar"))
+    # if args.project is not None:
+    #     wandb.login()
+    #     config = args.config if args.config else args
+    #     run = wandb.init(config=config, project=args.project, group=args.group)
+    #     wandb.log(
+    #         {
+    #             "collated/c-index": c_index,
+    #             "collated/c-index-std": std,
+    #         }
+    #     )

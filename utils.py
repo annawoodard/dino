@@ -116,8 +116,8 @@ def get_unused_local_port():
 
 def load_pretrained_checkpoint(model, pretrained_weights, checkpoint_key):
     state_dict = torch.load(pretrained_weights, map_location="cpu")
-    for key in ["in_chans", "fit_metadata", "test_metadata"]:
-        state_dict.pop(key)
+    # for key in ["in_chans", "fit_metadata", "test_metadata"]:
+    #     state_dict.pop(key)
     if checkpoint_key is not None and checkpoint_key in state_dict:
         logger.info(f"Take key {checkpoint_key} in provided checkpoint dict")
         state_dict = state_dict[checkpoint_key]
@@ -246,6 +246,8 @@ def cosine_scheduler(
 def bool_flag(s):
     """
     Parse boolean arguments from the command line.
+
+    Some tools, i.e. wandb, require flags.
     """
     FALSY_STRINGS = {"off", "false", "0"}
     TRUTHY_STRINGS = {"on", "true", "1"}
