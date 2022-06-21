@@ -1,4 +1,5 @@
 import os
+import logging
 import time
 from typing import Callable, Dict, Optional, Tuple, Union
 
@@ -44,7 +45,8 @@ def worker_init_fn(worker_id):
     np.random.seed(seed)
 
 
-def print_summary(label, df):
+def log_summary(label, df):
+    logger = logging.getLogger()
     table = [
         [
             len(df[df.event == 1]),
@@ -68,10 +70,10 @@ def print_summary(label, df):
     label = label + " dataset summary"
     label_width = len(label)
     padding = table_width - label_width - 1
-    print(f"\n{label} {'*' * padding}")
-    print(" " * 15 + "cases" + " " * 25 + "controls")
-    print("_" * 32 + "  " + "_" * 32)
-    print(table_text + "\n")
+    logger.info(f"\n{label} {'*' * padding}")
+    logger.info(" " * 15 + "cases" + " " * 25 + "controls")
+    logger.info("_" * 32 + "  " + "_" * 32)
+    logger.info(table_text + "\n")
 
 
 class ChiMECSSLDataset(Dataset):
@@ -101,7 +103,7 @@ class ChiMECSSLDataset(Dataset):
             controls = metadata[metadata.event == 0].sample(frac=prescale)
             metadata = pd.concat([cases, controls]).sample(frac=1)
         self.metadata = metadata
-        print_summary("pretraining mammo\n\n", self.metadata)
+        log_summary("pretraining mammo\n\n", self.metadata)
         # TODO ensure all inputs are in same orientation
         # TODO fix aspect ratio-- unilateral images should have final size h, h/2.
         self.resize = transforms.Resize(to_2tuple(image_size))
@@ -169,7 +171,7 @@ class ChiMECStackedSSLDataset(Dataset):
             metadata["exam_id"] + " " + metadata["ImageLaterality"]
         )
         self.metadata = metadata
-        print_summary("pretraining mammo\n\n", self.metadata)
+        log_summary("pretraining mammo\n\n", self.metadata)
         # TODO ensure all inputs are in same orientation
         # TODO fix aspect ratio-- unilateral images should have final size h, h/2.
         self.resize = transforms.Resize(to_2tuple(image_size))
@@ -529,8 +531,8 @@ def get_datasets(
         image_transform=val_transform,
     )
 
-    print_summary("train + validation", fit_metadata)
-    print_summary("testing", test_metadata)
+    log_summary("train + validation", fit_metadata)
+    log_summary("testing", test_metadata)
 
     # # Required by cumulative_dynamic_auc from sksurv.metrics for estimating
     # # the censorship distribution.
