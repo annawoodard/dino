@@ -510,7 +510,8 @@ def get_datasets(
     cv = StratifiedGroupKFold(
         n_splits=n_splits, shuffle=True, random_state=random_state
     )
-    dummy_x = np.ones(len(fit_metadata))  # This is a vestige in sklearn's API, not used
+    indexes = np.arange(len(fit_metadata))
+
     fit_datasets = [
         (
             ChiMECFinetuningTrainingDataset(
@@ -522,7 +523,7 @@ def get_datasets(
             ),
         )
         for train_indexes, val_indexes in cv.split(
-            dummy_x, fit_metadata.event, fit_metadata.study_id
+            indexes, fit_metadata.event, fit_metadata.study_id
         )
     ]
 
