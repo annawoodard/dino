@@ -1,11 +1,11 @@
 import argparse
 import json
 import logging
-import numpy as np
 import multiprocessing
 import os
 from pathlib import Path
 
+import numpy as np
 import torch
 import wandb
 
@@ -20,8 +20,7 @@ from torchvision import transforms as pth_transforms
 
 import utils
 import vision_transformer as vits
-from chimec import get_datasets, log_summary
-from chimec import ChiMECFinetuningTrainingDataset
+from chimec import ChiMECFinetuningTrainingDataset, get_datasets, log_summary
 from metrics import auc, concordance_index, predict_coxph_surv
 
 
@@ -101,6 +100,8 @@ def extract_features_and_labels(
 
 def train_mlp(gpu, result_queue, fold_queue, in_chans, args):
     torch.cuda.set_device(gpu)
+    if args.seed is None:
+        args.seed = torch.randint(0, 100000, (1,)).item()
     utils.fix_random_seeds(args.seed)
     cudnn.benchmark = True
     while fold_queue.qsize() > 0:
@@ -625,8 +626,6 @@ if __name__ == "__main__":
         help="which devices to use on local machine",
     )
     args = parser.parse_args()
-    if args.seed is None:
-        args.seed = torch.randint(0, 100000, (1,)).item()
     if args.devices is None:
         args.devices = list(range(torch.cuda.device_count()))
     if args.world_size is None:
