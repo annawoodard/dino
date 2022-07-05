@@ -1,4 +1,7 @@
 import argparse
+import lifelines
+import time
+import pandas as pd
 import json
 import logging
 import multiprocessing
@@ -22,6 +25,7 @@ import utils
 import vision_transformer as vits
 from chimec import get_datasets, log_summary
 from metrics import auc, concordance_index, predict_coxph_surv
+from loss import DeepCENTLoss, DeepCENTWithExactRankingLoss
 
 
 @torch.no_grad()
@@ -244,6 +248,16 @@ def train_mlp(gpu, result_queue, fold_queue, in_chans, args):
         best_c_index = 0.0
 
         early_stopping = utils.EarlyStopping(patience=args.patience)
+        if args.loss == "DeepCENTLoss":
+            loss_function = DeepCENTLoss(
+                lambda_m=args.lambda_m, lambda_p=args.lambda_p, lambda_r=args.lambda_r
+            )
+        elif args.loss == "DeepCENTWithExactRankingLoss":
+            loss_function = DeepCENTWithExactRankingLoss(
+                lambda_m=args.lambda_m, lambda_p=args.lambda_p, lambda_r=args.lambda_r
+            )
+        else:
+            loss_function = CoxPHLoss()
         for epoch in range(0, args.epochs):
             train_stats, train_outputs = train(
                 mlp,
@@ -253,6 +267,7 @@ def train_mlp(gpu, result_queue, fold_queue, in_chans, args):
                 train_events,
                 epoch,
                 args.batch_size_per_gpu,
+                loss_function,
             )
             scheduler.step()
 
@@ -276,6 +291,7 @@ def train_mlp(gpu, result_queue, fold_queue, in_chans, args):
                         train_events[:500].cuda(),
                         args.output_dir,
                         args.batch_size_per_gpu,
+                        loss_function,
                     )
 
                     for key, value in val_stats.items():
@@ -308,6 +324,7 @@ def train_mlp(gpu, result_queue, fold_queue, in_chans, args):
                 train_events[:500].cuda(),
                 args.output_dir,
                 args.batch_size_per_gpu,
+                loss_function,
             )
             logger.info(
                 f"Concordance index of the model trained with (train + val) datasets on the {test_features.shape[0]} test exams: {test_stats['c_index']:.3f}"
@@ -354,7 +371,9 @@ def extract_and_save(model, loader, args, path):
     return features, durations, events, study_ids
 
 
-def train(mlp, optimizer, features, durations, events, epoch, batch_size):
+def train(
+    mlp, optimizer, features, durations, events, epoch, batch_size, loss_function
+):
     logger = logging.getLogger()
     mlp.train()
     metric_logger = utils.MetricLogger(delimiter="  ")
@@ -375,7 +394,7 @@ def train(mlp, optimizer, features, durations, events, epoch, batch_size):
         # forward
         output = mlp(batch_features)
 
-        loss = CoxPHLoss()(output, batch_durations, batch_events)
+        loss = loss_function(output, batch_durations, batch_events)
         if torch.isnan(loss):
             raise RuntimeError("Loss is NaN!")
 
@@ -411,6 +430,7 @@ def validate_network(
     train_events,
     output_dir,
     batch_size,
+    loss_function,
 ):
     logger = logging.getLogger()
     mlp.eval()
@@ -430,7 +450,7 @@ def validate_network(
 
         output = mlp(batch_features)
 
-        loss = CoxPHLoss()(output, batch_durations, batch_events)
+        loss = loss_function(output, batch_durations, batch_events)
         if torch.isnan(loss):
             raise RuntimeError("Loss is NaN!")
 
@@ -440,15 +460,22 @@ def validate_network(
 
     outputs = torch.cat(outputs)
 
-    surv = predict_coxph_surv(
-        train_outputs,
-        train_years_to_event,
-        train_events,
-        outputs,
-        output_dir=output_dir,
-        sample=1.0,
+    if isinstance(loss_function, CoxPHLoss):
+        outputs = predict_coxph_surv(
+            train_outputs,
+            train_years_to_event,
+            train_events,
+            outputs,
+            output_dir=output_dir,
+            sample=1.0,
+        )
+    else:
+        outputs = torch.exp(outputs)
+
+    c_index = lifelines.utils.concordance_index(
+        durations.cpu(), outputs.cpu(), events.cpu()
     )
-    c_index = concordance_index(surv, durations, events)
+    # c_index = concordance_index(outputs, durations, events)
     # aucs = auc(surv, durations, events)
     metric_logger.update(c_index=c_index)
     # for key, value in aucs.items():
@@ -532,6 +559,31 @@ if __name__ == "__main__":
         default="",
         type=str,
         help="Path to pretrained weights to evaluate.",
+    )
+    parser.add_argument(
+        "--loss",
+        default="DeepCENTLoss",
+        type=str,
+        choices=["DeepCENTLoss", "DeepCENTWithExactRankingLoss", "CoxPHLoss"],
+        help="Loss function to use",
+    )
+    parser.add_argument(
+        "--lambda_m",
+        default=1.0,
+        type=float,
+        help="Lambda on MSE loss for DeepCENTLoss",
+    )
+    parser.add_argument(
+        "--lambda_p",
+        default=1.0,
+        type=float,
+        help="Lambda on penalty loss for DeepCENTLoss",
+    )
+    parser.add_argument(
+        "--lambda_r",
+        default=0.1,
+        type=float,
+        help="Lambda on rank loss for DeepCENTLoss",
     )
     parser.add_argument(
         "--checkpoint_key",
