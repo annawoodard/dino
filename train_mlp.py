@@ -681,6 +681,7 @@ if __name__ == "__main__":
         default=None,
         help="which devices to use on local machine",
     )
+    parser.add_argument("--project", default=None, type=str, help="wandb project")
     args = parser.parse_args()
     if args.devices is None:
         args.devices = list(range(torch.cuda.device_count()))
@@ -753,15 +754,27 @@ if __name__ == "__main__":
         join=True,
     )
     results = [result_queue.get() for i in range(result_queue.qsize())]
+    results = pd.DataFrame(results)
+    logger.info(
+        "training completed in {:.1f} minutes with mean c-index {:.3f} +/ {:.3f}; test c-index {:.3f}".format(
+            (time.time() - start) / 60.0,
+            results.c_index.mean(),
+            results.c_index.std(),
+            results[pd.isnull(results.fold)].c_index.iloc[0],
+        )
+    )
 
-    torch.save(results, os.path.join(args.output_dir, "results.pth.tar"))
-    # if args.project is not None:
-    #     wandb.login()
-    #     config = args.config if args.config else args
-    #     run = wandb.init(config=config, project=args.project, group=args.group)
-    #     wandb.log(
-    #         {
-    #             "collated/c-index": c_index,
-    #             "collated/c-index-std": std,
-    #         }
-    #     )
+    results.to_pickle(Path(args.output_dir) / "results.pkl")
+    with (Path(args.output_dir) / "args.json").open("w") as f:
+        f.write(json.dumps(vars(args)) + "\n")
+
+    if args.project is not None:
+        wandb.login()
+        config = args.config if args.config else args
+        run = wandb.init(config=config, project=args.project, group=args.group)
+        wandb.log(
+            {
+                "c-index": results.c_index.mean(),
+                "c-index-std": results.c_index.std(),
+            }
+        )
