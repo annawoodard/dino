@@ -20,7 +20,7 @@ from torchvision import transforms as pth_transforms
 
 import utils
 import vision_transformer as vits
-from chimec import ChiMECFinetuningTrainingDataset, get_datasets, log_summary
+from chimec import get_datasets, log_summary
 from metrics import auc, concordance_index, predict_coxph_surv
 
 
@@ -668,6 +668,7 @@ if __name__ == "__main__":
             fit_metadata,
             args.folds,
             args.seed,
+            in_chans,
         )
         torch.save(
             {"fit_datasets": fit_datasets, "test_dataset": test_dataset},

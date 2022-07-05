@@ -503,6 +503,7 @@ def get_datasets(
     fit_metadata,
     n_splits,
     random_state,
+    in_chans,
 ):
     if prescale:
         print(f"will use prescale of {prescale}")
@@ -515,13 +516,19 @@ def get_datasets(
         n_splits=n_splits, shuffle=True, random_state=random_state
     )
     indexes = np.arange(len(fit_metadata))
+    if in_chans == 1:
+        TrainingDataset = ChiMECFinetuningTrainingDataset
+        EvalDataset = ChiMECFinetuningEvalDataset
+    elif in_chans == 2:
+        TrainingDataset = ChiMECStackedFinetuningDataset
+        EvalDataset = ChiMECStackedFinetuningDataset
 
     fit_datasets = [
         (
-            ChiMECFinetuningTrainingDataset(
+            TrainingDataset(
                 fit_metadata.iloc[train_indexes], image_transform=train_transform
             ),
-            ChiMECFinetuningEvalDataset(
+            EvalDataset(
                 fit_metadata.iloc[val_indexes],
                 image_transform=val_transform,
             ),
@@ -531,7 +538,7 @@ def get_datasets(
         )
     ]
 
-    test_dataset = ChiMECFinetuningEvalDataset(
+    test_dataset = EvalDataset(
         test_metadata,
         image_transform=val_transform,
     )
