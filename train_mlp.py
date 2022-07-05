@@ -143,28 +143,28 @@ def train_mlp(gpu, result_queue, fold_queue, in_chans, args):
         if fold == None:
             train_loader = torch.utils.data.DataLoader(
                 train_dataset + val_dataset,
-                batch_size=args.batch_size_per_gpu,
+                batch_size=args.extraction_batch_size_per_gpu,
                 num_workers=args.num_workers,
                 pin_memory=True,
                 drop_last=True,
             )
             test_loader = torch.utils.data.DataLoader(
                 test_dataset,
-                batch_size=args.batch_size_per_gpu,
+                batch_size=args.extraction_batch_size_per_gpu,
                 num_workers=0,
                 pin_memory=True,
             )
         else:
             train_loader = torch.utils.data.DataLoader(
                 train_dataset,
-                batch_size=args.batch_size_per_gpu,
+                batch_size=args.extraction_batch_size_per_gpu,
                 num_workers=args.num_workers,
                 pin_memory=True,
                 drop_last=True,
             )
             test_loader = torch.utils.data.DataLoader(
                 val_dataset,
-                batch_size=args.batch_size_per_gpu,
+                batch_size=args.extraction_batch_size_per_gpu,
                 num_workers=0,
                 pin_memory=True,
             )
@@ -211,8 +211,6 @@ def train_mlp(gpu, result_queue, fold_queue, in_chans, args):
                 test_events,
                 test_study_ids,
             ) = extract_and_save(model, test_loader, args, test_serialize_path)
-        if args.save_features_and_exit:
-            continue
         del model
         mlp = BilateralMLP(
             train_features.shape[-1],
@@ -346,8 +344,10 @@ def train_mlp(gpu, result_queue, fold_queue, in_chans, args):
             f"Training of the supervised MLP on frozen features completed.\n"
             f"Best validation concordance index: {best_c_index:.3f}"
         )
+        result = test_stats if fold == None else val_stats
+        result["fold"] = fold
 
-        result_queue.put({fold: test_stats if fold == None else val_stats})
+        result_queue.put(result)
 
 
 def extract_and_save(model, loader, args, path):
@@ -522,6 +522,7 @@ class BilateralMLP(nn.Module):
 
 
 if __name__ == "__main__":
+    start = time.time()
     parser = argparse.ArgumentParser("Train MLP")
     parser.add_argument("--seed", default=None, type=int, help="Random seed.")
     parser.add_argument(
@@ -543,12 +544,6 @@ if __name__ == "__main__":
         default=False,
         type=utils.bool_flag,
         help="""Enable early stopping.""",
-    )
-    parser.add_argument(
-        "--save_features_and_exit",
-        default=False,
-        type=utils.bool_flag,
-        help="""Just save features (useful if you are memory-bound and want to save features with a small batch size)""",
     )
     parser.add_argument("--arch", default="vit_small", type=str, help="Architecture")
     parser.add_argument(
@@ -622,7 +617,16 @@ if __name__ == "__main__":
         help="Calculate baseline hazards with SAMPLE subset",
     )
     parser.add_argument(
-        "--batch_size_per_gpu", default=128, type=int, help="Per-GPU batch-size"
+        "--extraction_batch_size_per_gpu",
+        default=1,
+        type=int,
+        help="Per-GPU batch-size for feature extraction",
+    )
+    parser.add_argument(
+        "--batch_size_per_gpu",
+        default=128,
+        type=int,
+        help="Per-GPU batch-size for MLP training",
     )
     parser.add_argument(
         "--dist_url",
