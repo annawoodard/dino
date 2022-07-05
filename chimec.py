@@ -17,6 +17,8 @@ from timm.models.layers import to_2tuple
 from torch.utils.data import Dataset
 from torchvision import transforms
 
+logger = logging.getLogger()
+
 
 def stratified_group_split(
     # adapted from https://stackoverflow.com/a/64663756/5111510
@@ -46,7 +48,6 @@ def worker_init_fn(worker_id):
 
 
 def log_summary(label, df):
-    logger = logging.getLogger()
     table = [
         [
             len(df[df.event == 1]),
@@ -67,7 +68,10 @@ def log_summary(label, df):
     ]
     table_text = tabulate.tabulate(table, headers)
     table_width = len(table_text.split("\n")[0])
-    label = label + " dataset summary"
+    censoring_proportion = len(df[df.event == 0]) / len(df) * 100
+    label = (
+        label + f" dataset summary (censoring proportion: {censoring_proportion:.0f}%)"
+    )
     label_width = len(label)
     padding = table_width - label_width - 1
     logger.info(f"\n{label} {'*' * padding}")
