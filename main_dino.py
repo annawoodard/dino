@@ -293,6 +293,9 @@ def get_args_parser():
         default=None,
         help="which devices to use on local machine",
     )
+    parser.add_argument(
+        "--saveckp_freq", default=50, type=int, help="Save checkpoint every x epochs."
+    )
     return parser
 
 
@@ -504,6 +507,10 @@ def train_dino(gpu, args):
         if fp16_scaler is not None:
             save_dict["fp16_scaler"] = fp16_scaler.state_dict()
         utils.save_on_master(save_dict, os.path.join(args.output_dir, "checkpoint.pth"))
+        if args.saveckp_freq and epoch % args.saveckp_freq == 0:
+            utils.save_on_master(
+                save_dict, os.path.join(args.output_dir, f"checkpoint{epoch:04}.pth")
+            )
         log_stats = {
             **{f"train_{k}": v for k, v in train_stats.items()},
             "epoch": epoch,
