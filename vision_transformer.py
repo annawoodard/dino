@@ -184,7 +184,6 @@ class VisionTransformer(nn.Module):
         img_size=[224],
         patch_size=16,
         in_chans=2,
-        num_classes=0,
         embed_dim=768,
         depth=12,
         num_heads=12,
@@ -232,11 +231,6 @@ class VisionTransformer(nn.Module):
             ]
         )
         self.norm = norm_layer(embed_dim)
-
-        # Classifier head
-        self.head = (
-            nn.Linear(embed_dim, num_classes) if num_classes > 0 else nn.Identity()
-        )
 
         trunc_normal_(self.pos_embed, std=0.02)
         trunc_normal_(self.cls_token, std=0.02)
