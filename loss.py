@@ -5,7 +5,7 @@ https://github.com/yicjia/DeepCENT/blob/main/DeepCENT/deepcent_regular.py
 import numpy as np
 import torch
 import torch.nn as nn
-from concordance import concordance_index
+from concordance import td_concordance_index
 
 
 def one_pair(x0, x1):
@@ -82,7 +82,7 @@ class DeepCENTLoss(torch.nn.Module):
 
 class DeepCENTWithExactRankingLoss(DeepCENTLoss):
     def calculate_rank_loss(self, predictions, observations, events):
-        return concordance_index(
+        return td_concordance_index(
             observations,
             predictions,
             events,
