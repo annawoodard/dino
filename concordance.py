@@ -4,16 +4,13 @@ import torch
 
 logger = logging.getLogger()
 
-# @numba.jit(nopython=True)
-# @numba.jit(nopython=False)
-@torch.jit.script
+
+# @torch.jit.script
 def is_comparable(t_i, t_j, d_i, d_j):
     return ((t_i < t_j) & d_i) | ((t_i == t_j) & (d_i | d_j))
 
 
-# @numba.jit(nopython=True)
-# @numba.jit(nopython=False)
-@torch.jit.script
+# @torch.jit.script
 def is_concordant(s_i, s_j, t_i, t_j, d_i, d_j):
     conc = torch.Tensor([0.0]).cuda()
     if t_i < t_j:
@@ -28,18 +25,19 @@ def is_concordant(s_i, s_j, t_i, t_j, d_i, d_j):
     return conc * is_comparable(t_i, t_j, d_i, d_j)
 
 
-# @numba.jit(nopython=True, parallel=True)
-# @numba.jit(nopython=False, parallel=True)
-@torch.jit.script
-def sum_concordant_disc(
-    predicted_scores, durations, events_observed, is_concordant_func
-):
-    count = torch.Tensor([0.0]).cuda()
+def one_pair(x0, x1):
+    return 1 + nn.LogSigmoid()(x1 - x0) / np.log(2.0)
+
+
+# @torch.jit.script
+def sum_concordant_disc(predicted_scores, durations, events_observed):
+    # count = torch.Tensor([0.0]).cuda()
+    count = 0.0
     n = len(predicted_scores)
     for i in range(n):
         for j in range(n):
             if j != i:
-                count += is_concordant_func(
+                count = count + is_concordant(
                     predicted_scores[i],
                     predicted_scores[j],
                     durations[i],
@@ -50,19 +48,34 @@ def sum_concordant_disc(
     return count
 
 
-# @numba.jit(nopython=True, parallel=True)
-# @numba.jit(nopython=False)
-@torch.jit.script
-def sum_comparable(durations, events_observed, is_comparable_func):
-    n = durations.shape[0]
+# @torch.jit.script
+def sum_comparable(durations, events_observed):
     count = torch.Tensor([0.0]).cuda()
+    n = len(durations)
     for i in range(n):
         for j in range(n):
             if j != i:
-                count += is_comparable_func(
+                count = count + is_comparable(
                     durations[i], durations[j], events_observed[i], events_observed[j]
                 )
     return count
+
+
+def calculate_lower_bound_rank_loss(pred, obs, event):
+    N = pred.size(0)
+    # N x N
+    all_pairs = one_pair(pred.view(N, 1), pred.view(1, N))
+
+    well_ordered_pair = (obs.view(1, N) - obs.view(N, 1)) > 0
+
+    # True for pairs where Y_i < Y_j and Y_i is an event; False otherwise
+    lower_outcome_is_event = (event.view(1, N) + event.view(N, 1)) > 0
+
+    comparable_pair = well_ordered_pair * lower_outcome_is_event
+
+    out = all_pairs * comparable_pair.type(torch.uint8).cuda()
+
+    return out.sum() / comparable_pair.sum()
 
 
 # TODO estimate censoring distribution
@@ -103,8 +116,8 @@ def td_concordance_index(durations, predicted_scores, events_observed=None):
 
     try:
         return sum_concordant_disc(
-            predicted_scores, durations, events_observed, is_concordant
-        ) / sum_comparable(durations, events_observed, is_comparable)
+            predicted_scores, durations, events_observed
+        ) / sum_comparable(durations, events_observed)
     except ZeroDivisionError:
         print(
             "The c-index is not well-defined if there are no positive examples; returning c-index=-1"

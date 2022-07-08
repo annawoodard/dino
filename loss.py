@@ -29,12 +29,13 @@ def calculate_lower_bound_rank_loss(pred, obs, event):
     return out.sum() / comparable_pair.sum()
 
 
-def calculate_mse_loss(pred, obs, delta):
-    mse = delta * ((pred - obs) ** 2)
+def calculate_mse_loss(pred, obs, event):
+    # for positive events, use vanilla MSE
+    mse = event * ((pred - obs) ** 2)
 
-    ind = pred < obs
-    delta0 = 1 - delta
-    p = ind * delta0 * (obs - pred) ** 2
+    # for negative events (i.e. censored samples),
+    #
+    p = (1 - event) * (pred < obs) * ((pred - obs) ** 2)
     return mse.mean(), p.mean()
 
 
