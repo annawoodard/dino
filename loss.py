@@ -59,7 +59,7 @@ class DeepCENTLoss(torch.nn.Module):
         return (
             self.lambda_m * mse_loss,
             self.lambda_p * penalty_loss,
-            self.lambda_r * rank_loss
+            -self.lambda_r * rank_loss,
         )
 
         #     for X_batch, y_batch, E_batch in test_loader:

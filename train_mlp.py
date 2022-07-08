@@ -24,7 +24,7 @@ from torchvision import transforms as pth_transforms
 import utils
 import vision_transformer as vits
 from chimec import get_datasets, log_summary
-from metrics import auc, concordance_index, predict_coxph_surv
+from metrics import auc, predict_coxph_surv
 from loss import DeepCENTLoss, DeepCENTWithExactRankingLoss
 
 
@@ -683,6 +683,15 @@ if __name__ == "__main__":
         "--output_dir", default=".", help="Path to save logs and checkpoints"
     )
     parser.add_argument(
+        "--config", default=None, type=str
+    )  # TODO implement config loading from yaml
+    parser.add_argument(
+        "--autolabel",
+        default=False,
+        help="Make final output directory in an automatically labeled directory under OUTPUT_DIR",
+        type=utils.bool_flag,
+    )
+    parser.add_argument(
         "--features_dir", default=".", help="Path to checkpoint features"
     )
     parser.add_argument(
@@ -708,8 +717,7 @@ if __name__ == "__main__":
     if args.world_size is None:
         args.world_size = len(args.devices)
     args.port = str(utils.get_unused_local_port())
-    for fold in range(args.folds):
-        Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+    args.output_dir = utils.prepare_output_dir(args.output_dir, args.autolabel)
     Path(args.features_dir).mkdir(parents=True, exist_ok=True)
     state_dict = torch.load(args.pretrained_weights, map_location="cpu")
     in_chans = state_dict.pop("in_chans")
@@ -776,7 +784,7 @@ if __name__ == "__main__":
     results = [result_queue.get() for i in range(result_queue.qsize())]
     results = pd.DataFrame(results)
     logger.info(
-        "training completed in {:.1f} minutes with mean c-index {:.3f} +/ {:.3f}; test c-index {:.3f}".format(
+        "training completed in {:.1f} minutes with mean validation c-index {:.3f} +/ {:.3f}; test c-index {:.3f}".format(
             (time.time() - start) / 60.0,
             results.c_index.mean(),
             results.c_index.std(),
@@ -794,7 +802,7 @@ if __name__ == "__main__":
         run = wandb.init(config=config, project=args.project, group=args.group)
         wandb.log(
             {
-                "c-index": results.c_index.mean(),
-                "c-index-std": results.c_index.std(),
+                "c_index": results.c_index.mean(),
+                "c_index_std": results.c_index.std(),
             }
         )

@@ -35,6 +35,7 @@ from torch import nn
 import torch.distributed as dist
 from PIL import ImageFilter, ImageOps
 import git
+from pathlib import Path
 
 logger = logging.getLogger()
 
@@ -50,6 +51,19 @@ def save(obj, path):
     """
     torch.save(obj, path + ".partial")
     os.rename(path + ".partial", path)
+
+
+def prepare_output_dir(output_dir, autolabel, group=None):
+    if autolabel is True:
+        output_dir = os.path.join(
+            output_dir,
+            group
+            if group is not None
+            else datetime.datetime.now().strftime("%Y_%m_%d_%H_%M"),
+        )
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+
+    return output_dir
 
 
 def log_code_state(dir):
