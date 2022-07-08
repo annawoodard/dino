@@ -33,8 +33,9 @@ def calculate_mse_loss(pred, obs, event):
     # for positive events, use vanilla MSE
     mse = event * ((pred - obs) ** 2)
 
-    # for negative events (i.e. censored samples),
-    #
+    # for negative events (i.e. censored data points),
+    # calculate MSE of events where pred < obs; error is
+    # not defined when pred > obs
     p = (1 - event) * (pred < obs) * ((pred - obs) ** 2)
     return mse.mean(), p.mean()
 
@@ -56,9 +57,9 @@ class DeepCENTLoss(torch.nn.Module):
         rank_loss = self.calculate_rank_loss(predictions, observations, events)
 
         return (
-            self.lambda_m * mse_loss
-            + self.lambda_p * penalty_loss
-            - self.lambda_r * rank_loss
+            self.lambda_m * mse_loss,
+            self.lambda_p * penalty_loss,
+            self.lambda_r * rank_loss
         )
 
         #     for X_batch, y_batch, E_batch in test_loader:
@@ -83,8 +84,12 @@ class DeepCENTLoss(torch.nn.Module):
 
 class DeepCENTWithExactRankingLoss(DeepCENTLoss):
     def calculate_rank_loss(self, predictions, observations, events):
-        return td_concordance_index(
-            observations,
-            predictions,
-            events,
-        )
+        return td_concordance_index(predictions, observations, events)
+
+
+class ConcordanceIndexLoss(nn.Module):
+    def __init__(self) -> None:
+        super(ConcordanceIndexLoss, self).__init__()
+
+    def forward(pred, obs, event):
+        return td_concordance_index(pred, obs, event)

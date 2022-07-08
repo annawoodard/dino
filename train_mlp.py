@@ -247,15 +247,15 @@ def train_mlp(gpu, result_queue, fold_queue, in_chans, args):
 
         early_stopping = utils.EarlyStopping(patience=args.patience)
         if args.loss == "DeepCENTLoss":
-            loss_function = DeepCENTLoss(
+            criterion = DeepCENTLoss(
                 lambda_m=args.lambda_m, lambda_p=args.lambda_p, lambda_r=args.lambda_r
             )
         elif args.loss == "DeepCENTWithExactRankingLoss":
-            loss_function = DeepCENTWithExactRankingLoss(
+            criterion = DeepCENTWithExactRankingLoss(
                 lambda_m=args.lambda_m, lambda_p=args.lambda_p, lambda_r=args.lambda_r
             )
         else:
-            loss_function = CoxPHLoss()
+            criterion = CoxPHLoss()
         for epoch in range(0, args.epochs):
             train_stats, train_outputs = train(
                 mlp,
@@ -265,7 +265,7 @@ def train_mlp(gpu, result_queue, fold_queue, in_chans, args):
                 train_events,
                 epoch,
                 args.batch_size_per_gpu,
-                loss_function,
+                criterion,
             )
             scheduler.step()
 
@@ -289,7 +289,7 @@ def train_mlp(gpu, result_queue, fold_queue, in_chans, args):
                         train_events[:500].cuda(),
                         args.output_dir,
                         args.batch_size_per_gpu,
-                        loss_function,
+                        criterion,
                     )
 
                     for key, value in val_stats.items():
@@ -322,7 +322,7 @@ def train_mlp(gpu, result_queue, fold_queue, in_chans, args):
                 train_events[:500].cuda(),
                 args.output_dir,
                 args.batch_size_per_gpu,
-                loss_function,
+                criterion,
             )
             logger.info(
                 f"Concordance index of the model trained with (train + val) datasets on the {test_features.shape[0]} test exams: {test_stats['c_index']:.3f}"
@@ -371,9 +371,7 @@ def extract_and_save(model, loader, args, path):
     return features, durations, events, study_ids
 
 
-def train(
-    mlp, optimizer, features, durations, events, epoch, batch_size, loss_function
-):
+def train(mlp, optimizer, features, durations, events, epoch, batch_size, criterion):
     logger = logging.getLogger()
     mlp.train()
     metric_logger = utils.MetricLogger(delimiter="  ")
@@ -394,10 +392,21 @@ def train(
         # forward
         output = mlp(batch_features)
 
-        loss = loss_function(output, batch_durations, batch_events)
+        if isinstance(criterion, CoxPHLoss):
+            loss = criterion(output, batch_durations, batch_events)
+            metric_logger.update(loss=loss.item())
+        else:
+            mse_loss, penalty_loss, rank_loss = criterion(
+                output, batch_durations, batch_events
+            )
+            loss = mse_loss + penalty_loss + rank_loss
+            metric_logger.update(
+                mse_loss=mse_loss.item(),
+                penalty_loss=penalty_loss.item(),
+                rank_loss=rank_loss.item(),
+            )
         if torch.isnan(loss):
             raise RuntimeError("Loss is NaN!")
-
         # compute the gradients
         optimizer.zero_grad()
         loss.backward()
@@ -430,7 +439,7 @@ def validate_network(
     train_events,
     output_dir,
     batch_size,
-    loss_function,
+    criterion,
 ):
     logger = logging.getLogger()
     mlp.eval()
@@ -450,17 +459,28 @@ def validate_network(
 
         output = mlp(batch_features)
 
-        loss = loss_function(output, batch_durations, batch_events)
+        if isinstance(criterion, CoxPHLoss):
+            loss = criterion(output, batch_durations, batch_events)
+            metric_logger.update(loss=loss.item())
+        else:
+            mse_loss, penalty_loss, rank_loss = criterion(
+                output, batch_durations, batch_events
+            )
+            loss = mse_loss + penalty_loss + rank_loss
+            metric_logger.update(
+                loss=loss.item(),
+                mse_loss=mse_loss.item(),
+                penalty_loss=penalty_loss.item(),
+                rank_loss=rank_loss.item(),
+            )
         if torch.isnan(loss):
             raise RuntimeError("Loss is NaN!")
-
-        metric_logger.update(loss=loss.item())
 
         outputs += [output]
 
     outputs = torch.cat(outputs)
 
-    if isinstance(loss_function, CoxPHLoss):
+    if isinstance(criterion, CoxPHLoss):
         outputs = predict_coxph_surv(
             train_outputs,
             train_years_to_event,
