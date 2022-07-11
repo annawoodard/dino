@@ -1,4 +1,5 @@
 import argparse
+import matplotlib.pyplot as plt
 import lifelines
 import time
 import pandas as pd
@@ -20,17 +21,23 @@ from pycox.models.loss import CoxPHLoss
 from torch import nn
 from torch.utils.tensorboard import SummaryWriter
 from torchvision import transforms as pth_transforms
+from torchvision.utils import make_grid
 
 import utils
 import vision_transformer as vits
 from chimec import get_datasets, log_summary
 from metrics import auc, predict_coxph_surv
-from loss import DeepCENTLoss, DeepCENTWithExactRankingLoss
+from loss import DeepCENTLoss
 
 
 @torch.no_grad()
 def extract_features_and_labels(
-    encoder, data_loader, multiscale=False, avgpool=False, n_last_blocks=4
+    encoder,
+    data_loader,
+    multiscale=False,
+    avgpool=False,
+    n_last_blocks=4,
+    return_images=False,
 ):
     logger = logging.getLogger()
     logger.info(f"Extracting features for {len(data_loader.dataset)} samples")
@@ -39,6 +46,8 @@ def extract_features_and_labels(
     years_to_events = []
     events = []
     study_ids = []
+    images = []
+    contralateral_images = []
 
     for (
         image,
@@ -93,13 +102,19 @@ def extract_features_and_labels(
         years_to_events += [years_to_event]
         events += [event]
         study_ids += [study_id]
+        if return_images:
+            images += [image]
+            contralateral_images += [contralateral_image]
 
     features = torch.cat(features)
     years_to_events = torch.cat(years_to_events)
     events = torch.cat(events)
     study_ids = torch.cat(study_ids)
+    # if return_images:
+    #     images = torch.cat(images)
+    #     contralateral_images = torch.cat(contralateral_images)
 
-    return features, years_to_events, events, study_ids
+    return features, years_to_events, events, study_ids, images, contralateral_images
 
 
 def train_mlp(gpu, result_queue, fold_queue, in_chans, args):
@@ -141,33 +156,14 @@ def train_mlp(gpu, result_queue, fold_queue, in_chans, args):
             train_dataset, val_dataset = fit_datasets[args.fold]
 
         if fold == None:
-            train_loader = torch.utils.data.DataLoader(
-                train_dataset + val_dataset,
-                batch_size=args.extraction_batch_size_per_gpu,
-                num_workers=args.num_workers,
-                pin_memory=True,
-                drop_last=True,
-            )
-            test_loader = torch.utils.data.DataLoader(
-                test_dataset,
-                batch_size=args.extraction_batch_size_per_gpu,
-                num_workers=0,
-                pin_memory=True,
-            )
+            fit_dataset = train_dataset + val_dataset
+            return_images = True
+            # return_images = args.log_images
+
         else:
-            train_loader = torch.utils.data.DataLoader(
-                train_dataset,
-                batch_size=args.extraction_batch_size_per_gpu,
-                num_workers=args.num_workers,
-                pin_memory=True,
-                drop_last=True,
-            )
-            test_loader = torch.utils.data.DataLoader(
-                val_dataset,
-                batch_size=args.extraction_batch_size_per_gpu,
-                num_workers=0,
-                pin_memory=True,
-            )
+            fit_dataset = train_dataset
+            test_dataset = val_dataset
+            return_images = False
 
         if args.arch in vits.__dict__.keys():
             model = vits.__dict__[args.arch](
@@ -189,6 +185,8 @@ def train_mlp(gpu, result_queue, fold_queue, in_chans, args):
                 train_durations,
                 train_events,
                 train_study_ids,
+                _,
+                _,
             ) = torch.load(train_serialize_path)
         except (RuntimeError, FileNotFoundError):
             (
@@ -196,13 +194,24 @@ def train_mlp(gpu, result_queue, fold_queue, in_chans, args):
                 train_durations,
                 train_events,
                 train_study_ids,
-            ) = extract_and_save(model, train_loader, args, train_serialize_path)
+                _,
+                _,
+            ) = extract_and_save(
+                model,
+                fit_dataset,
+                args.num_workers,
+                args,
+                train_serialize_path,
+                return_images=False,
+            )
         try:
             (
                 test_features,
                 test_durations,
                 test_events,
                 test_study_ids,
+                test_images,
+                test_contralateral_images,
             ) = torch.load(test_serialize_path)
         except (RuntimeError, FileNotFoundError):
             (
@@ -210,7 +219,16 @@ def train_mlp(gpu, result_queue, fold_queue, in_chans, args):
                 test_durations,
                 test_events,
                 test_study_ids,
-            ) = extract_and_save(model, test_loader, args, test_serialize_path)
+                test_images,
+                test_contralateral_images,
+            ) = extract_and_save(
+                model,
+                test_dataset,
+                0,
+                args,
+                test_serialize_path,
+                return_images=return_images,
+            )
         del model
         mlp = BilateralMLP(
             train_features.shape[-1],
@@ -235,7 +253,7 @@ def train_mlp(gpu, result_queue, fold_queue, in_chans, args):
         optimizer = torch.optim.SGD(
             mlp.parameters(),
             args.lr
-            * (args.batch_size_per_gpu * utils.get_world_size())
+            * (args.batch_size * utils.get_world_size())
             / 256.0,  # linear scaling rule
             momentum=0.9,
             weight_decay=0,  # we do not apply weight decay
@@ -247,13 +265,7 @@ def train_mlp(gpu, result_queue, fold_queue, in_chans, args):
 
         early_stopping = utils.EarlyStopping(patience=args.patience)
         if args.loss == "DeepCENTLoss":
-            criterion = DeepCENTLoss(
-                lambda_m=args.lambda_m, lambda_p=args.lambda_p, lambda_r=args.lambda_r
-            )
-        elif args.loss == "DeepCENTWithExactRankingLoss":
-            criterion = DeepCENTWithExactRankingLoss(
-                lambda_m=args.lambda_m, lambda_p=args.lambda_p, lambda_r=args.lambda_r
-            )
+            criterion = DeepCENTLoss(lambda_p=args.lambda_p, lambda_r=args.lambda_r)
         else:
             criterion = CoxPHLoss()
         for epoch in range(0, args.epochs):
@@ -264,7 +276,7 @@ def train_mlp(gpu, result_queue, fold_queue, in_chans, args):
                 train_durations,
                 train_events,
                 epoch,
-                args.batch_size_per_gpu,
+                args.batch_size,
                 criterion,
             )
             scheduler.step()
@@ -279,7 +291,11 @@ def train_mlp(gpu, result_queue, fold_queue, in_chans, args):
                 f.write(json.dumps(log_stats) + "\n")
             if fold != None:
                 if (epoch % args.val_freq == 0) or (epoch == args.epochs - 1):
-                    val_stats = validate_network(
+                    (
+                        val_stats,
+                        lowest_loss_indices,
+                        highest_loss_indices,
+                    ) = validate_network(
                         test_features,
                         test_durations,
                         test_events,
@@ -288,12 +304,31 @@ def train_mlp(gpu, result_queue, fold_queue, in_chans, args):
                         train_durations[:500].cuda(),
                         train_events[:500].cuda(),
                         args.output_dir,
-                        args.batch_size_per_gpu,
+                        # args.batch_size,
+                        32,
                         criterion,
                     )
 
                     for key, value in val_stats.items():
                         log_writer.add_scalar(f"val/{key}", value, epoch)
+
+                    img_grid = make_grid(
+                        test_images[highest_loss_indices[0] : highest_loss_indices[1]]
+                        + test_contralateral_images[
+                            highest_loss_indices[0] : highest_loss_indices[1]
+                        ]
+                    )
+                    plt.imshow(img_grid, cmap="Greys")
+                    log_writer.add_image("highest_loss_images", img_grid)
+                    img_grid = make_grid(
+                        test_images[lowest_loss_indices[0] : lowest_loss_indices[1]]
+                        + test_contralateral_images[
+                            lowest_loss_indices[0] : lowest_loss_indices[1]
+                        ]
+                    )
+                    plt.imshow(img_grid, cmap="Greys")
+                    log_writer.add_image("lowest_loss_images", img_grid)
+
                     early_stopping(val_stats["loss"])
                     if args.early_stop and early_stopping.early_stop:
                         break
@@ -321,7 +356,7 @@ def train_mlp(gpu, result_queue, fold_queue, in_chans, args):
                 train_durations[:500].cuda(),
                 train_events[:500].cuda(),
                 args.output_dir,
-                args.batch_size_per_gpu,
+                args.batch_size,
                 criterion,
             )
             logger.info(
@@ -335,10 +370,14 @@ def train_mlp(gpu, result_queue, fold_queue, in_chans, args):
             }
             with (Path(args.output_dir) / "test_log.txt").open("a") as f:
                 f.write(json.dumps(log_stats) + "\n")
-            save_dict = {
-                "state_dict": mlp.state_dict(),
-            }
-            torch.save(save_dict, os.path.join(args.output_dir, "checkpoint.pth.tar"))
+            # to conserve space, do not save a checkpoint if this is a sweep
+            if args.project is None:
+                save_dict = {
+                    "state_dict": mlp.state_dict(),
+                }
+                torch.save(
+                    save_dict, os.path.join(args.output_dir, "checkpoint.pth.tar")
+                )
 
         logger.info(
             f"Training of the supervised MLP on frozen features completed.\n"
@@ -350,13 +389,29 @@ def train_mlp(gpu, result_queue, fold_queue, in_chans, args):
         result_queue.put(result)
 
 
-def extract_and_save(model, loader, args, path):
-    (features, durations, events, study_ids,) = extract_features_and_labels(
+def extract_and_save(model, dataset, num_workers, args, path, return_images=False):
+    loader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=args.extraction_batch_size,
+        num_workers=num_workers,
+        pin_memory=True,
+        drop_last=True,
+    )
+    (
+        features,
+        durations,
+        events,
+        study_ids,
+        paths,
+        images,
+        contralateral_images,
+    ) = extract_features_and_labels(
         model,
         loader,
         multiscale=False,
         avgpool=args.avgpool_patchtokens,
         n_last_blocks=args.n_last_blocks,
+        return_images=return_images,
     )
     torch.save(
         [
@@ -364,11 +419,13 @@ def extract_and_save(model, loader, args, path):
             durations.cpu(),
             events.cpu(),
             study_ids.cpu(),
+            images.cpu(),
+            contralateral_images.cpu(),
         ],
         path,
     )
 
-    return features, durations, events, study_ids
+    return features, durations, events, study_ids, images, contralateral_images
 
 
 def train(mlp, optimizer, features, durations, events, epoch, batch_size, criterion):
@@ -452,6 +509,8 @@ def validate_network(
     uppers = lowers + batch_size
     # Merge last partial batch with previous batch; loss is undefined with no positive examples
     uppers[-1] = num_samples
+    highest_loss = -torch.inf
+    lowest_loss = torch.inf
     for lower, upper in metric_logger.log_every(list(zip(lowers, uppers)), 20, header):
         batch_features = features[lower:upper, :].cuda(non_blocking=True)
         batch_durations = durations[lower:upper].cuda(non_blocking=True)
@@ -475,6 +534,10 @@ def validate_network(
             )
         if torch.isnan(loss):
             raise RuntimeError("Loss is NaN!")
+        if loss < lowest_loss:
+            lowest_loss_indices = (lower, upper)
+        if loss > highest_loss:
+            highest_loss_indices = (lower, upper)
 
         outputs += [output]
 
@@ -507,7 +570,11 @@ def validate_network(
             losses=metric_logger.loss,
         )
     )
-    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+    return (
+        {k: meter.global_avg for k, meter in metric_logger.meters.items()},
+        lowest_loss_indices,
+        highest_loss_indices,
+    )
 
 
 class BilateralMLP(nn.Module):
@@ -560,6 +627,12 @@ if __name__ == "__main__":
         We typically set this to False for ViT-Small and to True with ViT-Base.""",
     )
     parser.add_argument(
+        "--log_images",
+        default=False,
+        type=utils.bool_flag,
+        help="""Whether or not to log example images to Tensorboard""",
+    )
+    parser.add_argument(
         "--early_stop",
         default=False,
         type=utils.bool_flag,
@@ -579,14 +652,8 @@ if __name__ == "__main__":
         "--loss",
         default="DeepCENTLoss",
         type=str,
-        choices=["DeepCENTLoss", "DeepCENTWithExactRankingLoss", "CoxPHLoss"],
+        choices=["DeepCENTLoss", "CoxPHLoss"],
         help="Loss function to use",
-    )
-    parser.add_argument(
-        "--lambda_m",
-        default=1.0,
-        type=float,
-        help="Lambda on MSE loss for DeepCENTLoss",
     )
     parser.add_argument(
         "--lambda_p",
@@ -637,13 +704,13 @@ if __name__ == "__main__":
         help="Calculate baseline hazards with SAMPLE subset",
     )
     parser.add_argument(
-        "--extraction_batch_size_per_gpu",
+        "--extraction_batch_size",
         default=1,
         type=int,
         help="Per-GPU batch-size for feature extraction",
     )
     parser.add_argument(
-        "--batch_size_per_gpu",
+        "--batch_size",
         default=128,
         type=int,
         help="Per-GPU batch-size for MLP training",
@@ -799,10 +866,11 @@ if __name__ == "__main__":
     if args.project is not None:
         wandb.login()
         config = args.config if args.config else args
-        run = wandb.init(config=config, project=args.project, group=args.group)
+        run = wandb.init(config=config, project=args.project)
         wandb.log(
             {
-                "c_index": results.c_index.mean(),
-                "c_index_std": results.c_index.std(),
+                "val_c_index": results[~pd.isnull(results.fold)].c_index.mean(),
+                "val_c_index_std": results[~pd.isnull(results.fold)].c_index.std(),
+                "test_c_index": results[pd.isnull(results.fold)].c_index,
             }
         )

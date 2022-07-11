@@ -1,7 +1,9 @@
 import os
+import retry
 import logging
 import time
 from typing import Callable, Dict, Optional, Tuple, Union
+from retry import retry
 
 # import cv2
 import nibabel as nib
@@ -18,6 +20,11 @@ from torch.utils.data import Dataset
 from torchvision import transforms
 
 logger = logging.getLogger()
+
+
+@retry(tries=3, delay=1, backoff=2)
+def open_image(filename):
+    return Image.open(filename).convert("L")
 
 
 def stratified_group_split(
@@ -113,14 +120,6 @@ class ChiMECSSLDataset(Dataset):
         self.resize = transforms.Resize(to_2tuple(image_size))
         self.transform = transform
 
-    def load_png(self, filename):
-        try:
-            image = Image.open(filename).convert("L")
-        except OSError:
-            time.sleep(2)
-            image = Image.open(filename).convert("L")
-        return image
-
     def __len__(self) -> int:
         length = 0
         if self.metadata is not None:
@@ -139,7 +138,7 @@ class ChiMECSSLDataset(Dataset):
         """
         series = self.metadata.iloc[idx]
         filename = series["png_path"]
-        image = self.resize(self.load_png(filename))
+        image = self.resize(load_png(filename))
         return self.transform(image)
 
 
@@ -195,14 +194,6 @@ class ChiMECStackedSSLDataset(Dataset):
         # TODO investigate, these should already be removed
         print(f"Removed {missing_views} view sets without both views")
 
-    def load_png(self, filename):
-        try:
-            image = Image.open(filename).convert("L")
-        except OSError:
-            time.sleep(2)
-            image = Image.open(filename).convert("L")
-        return image
-
     def __len__(self) -> int:
         if self.metadata is not None:
             return len(self.lateral_view_sets)
@@ -219,7 +210,7 @@ class ChiMECStackedSSLDataset(Dataset):
         """
         lateral_view_set = self.lateral_view_sets[idx]
         cc_view = self.resize(
-            self.load_png(
+            load_png(
                 self.metadata[
                     (self.metadata.lateral_view_set == lateral_view_set)
                     & (self.metadata.ViewPosition == "CC")
@@ -229,7 +220,7 @@ class ChiMECStackedSSLDataset(Dataset):
             )
         )
         mlo_view = self.resize(
-            self.load_png(
+            load_png(
                 self.metadata[
                     (self.metadata.lateral_view_set == lateral_view_set)
                     & (self.metadata.ViewPosition == "MLO")
@@ -265,14 +256,14 @@ class ChiMECFinetuningTrainingDataset(Dataset):
                 f"Removed {original - len(self.exams)} exams without both lateralities"
             )
 
+    def __len__(self) -> int:
+        return len(self.metadata)
+
     def load_image(self, filename):
-        image = Image.open(filename).convert("L")
+        image = open_image(filename)
         if self.image_transform is not None:
             return self.image_transform(image)
         return image
-
-    def __len__(self) -> int:
-        return len(self.metadata)
 
     def __getitem__(self, idx: int) -> Dict:
         series = self.metadata.iloc[idx]
@@ -322,14 +313,14 @@ class ChiMECFinetuningEvalDataset(Dataset):
                 f"Removed {original - len(self.exams)} exams without both lateralities and CC views"
             )
 
+    def __len__(self) -> int:
+        return len(self.exams)
+
     def load_image(self, filename):
-        image = Image.open(filename).convert("L")
+        image = open_image(filename)
         if self.image_transform is not None:
             return self.image_transform(image)
         return image
-
-    def __len__(self) -> int:
-        return len(self.exams)
 
     def __getitem__(self, idx: int) -> Dict:
         exam = self.exams[idx]
@@ -391,7 +382,7 @@ class ChiMECStackedFinetuningDataset(Dataset):
             )
 
     def load_image(self, filename):
-        image = Image.open(filename).convert("L")
+        image = open_image(filename)
         if self.image_transform is not None:
             return self.image_transform(image)
         return image

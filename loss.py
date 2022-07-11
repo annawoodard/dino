@@ -5,7 +5,6 @@ https://github.com/yicjia/DeepCENT/blob/main/DeepCENT/deepcent_regular.py
 import numpy as np
 import torch
 import torch.nn as nn
-from concordance import td_concordance_index
 
 
 def one_pair(x0, x1):
@@ -43,9 +42,8 @@ def calculate_mse_loss(pred, obs, event):
 class DeepCENTLoss(torch.nn.Module):
     """DeepCENT loss function"""
 
-    def __init__(self, lambda_m, lambda_p, lambda_r):
+    def __init__(self, lambda_p, lambda_r):
         super().__init__()
-        self.lambda_m = lambda_m
         self.lambda_p = lambda_p
         self.lambda_r = lambda_r
 
@@ -57,7 +55,7 @@ class DeepCENTLoss(torch.nn.Module):
         rank_loss = self.calculate_rank_loss(predictions, observations, events)
 
         return (
-            self.lambda_m * mse_loss,
+            mse_loss,
             self.lambda_p * penalty_loss,
             -self.lambda_r * rank_loss,
         )
@@ -80,16 +78,3 @@ class DeepCENTLoss(torch.nn.Module):
         # y_pred_list_lower = y_test_pred_mean - 1.96 * y_test_pred_sd
 
     # return y_pred_list0, y_pred_list, y_pred_list_upper, y_pred_list_lower
-
-
-class DeepCENTWithExactRankingLoss(DeepCENTLoss):
-    def calculate_rank_loss(self, predictions, observations, events):
-        return td_concordance_index(predictions, observations, events)
-
-
-class ConcordanceIndexLoss(nn.Module):
-    def __init__(self) -> None:
-        super(ConcordanceIndexLoss, self).__init__()
-
-    def forward(pred, obs, event):
-        return td_concordance_index(pred, obs, event)
