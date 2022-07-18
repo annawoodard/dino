@@ -110,9 +110,6 @@ def extract_features_and_labels(
     years_to_events = torch.cat(years_to_events)
     events = torch.cat(events)
     study_ids = torch.cat(study_ids)
-    # if return_images:
-    #     images = torch.cat(images)
-    #     contralateral_images = torch.cat(contralateral_images)
 
     return features, years_to_events, events, study_ids, images, contralateral_images
 
@@ -291,11 +288,7 @@ def train_mlp(gpu, result_queue, fold_queue, in_chans, args):
                 f.write(json.dumps(log_stats) + "\n")
             if fold != None:
                 if (epoch % args.val_freq == 0) or (epoch == args.epochs - 1):
-                    (
-                        val_stats,
-                        lowest_loss_indices,
-                        highest_loss_indices,
-                    ) = validate_network(
+                    (val_stats, _, _,) = validate_network(
                         test_features,
                         test_durations,
                         test_events,
@@ -304,30 +297,12 @@ def train_mlp(gpu, result_queue, fold_queue, in_chans, args):
                         train_durations[:500].cuda(),
                         train_events[:500].cuda(),
                         args.output_dir,
-                        # args.batch_size,
-                        32,
+                        args.batch_size,
                         criterion,
                     )
 
                     for key, value in val_stats.items():
                         log_writer.add_scalar(f"val/{key}", value, epoch)
-
-                    img_grid = make_grid(
-                        test_images[highest_loss_indices[0] : highest_loss_indices[1]]
-                        + test_contralateral_images[
-                            highest_loss_indices[0] : highest_loss_indices[1]
-                        ]
-                    )
-                    plt.imshow(img_grid, cmap="Greys")
-                    log_writer.add_image("highest_loss_images", img_grid)
-                    img_grid = make_grid(
-                        test_images[lowest_loss_indices[0] : lowest_loss_indices[1]]
-                        + test_contralateral_images[
-                            lowest_loss_indices[0] : lowest_loss_indices[1]
-                        ]
-                    )
-                    plt.imshow(img_grid, cmap="Greys")
-                    log_writer.add_image("lowest_loss_images", img_grid)
 
                     early_stopping(val_stats["loss"])
                     if args.early_stop and early_stopping.early_stop:
@@ -347,7 +322,7 @@ def train_mlp(gpu, result_queue, fold_queue, in_chans, args):
                     ) as f:
                         f.write(json.dumps(log_stats) + "\n")
         if fold == None:
-            test_stats = validate_network(
+            (test_stats, lowest_loss_indices, highest_loss_indices,) = validate_network(
                 test_features,
                 test_durations,
                 test_events,
@@ -356,12 +331,72 @@ def train_mlp(gpu, result_queue, fold_queue, in_chans, args):
                 train_durations[:500].cuda(),
                 train_events[:500].cuda(),
                 args.output_dir,
-                args.batch_size,
+                # args.batch_size,
+                35,
                 criterion,
             )
             logger.info(
                 f"Concordance index of the model trained with (train + val) datasets on the {test_features.shape[0]} test exams: {test_stats['c_index']:.3f}"
             )
+
+            def prepare_images(images, contralateral_images, indices):
+                result = []
+                for i, c in zip(
+                    images[indices[0] : indices[1]],
+                    contralateral_images[indices[0] : indices[1]],
+                ):
+                    result += [torch.cat([i.squeeze(0), c.squeeze(0)], dim=1)]
+
+                return result
+                # result = (
+                #     images[indices[0] : indices[1]]
+                #     + contralateral_images[indices[0] : indices[1]]
+                # )
+
+                # return [i.squeeze(0) for i in result]
+
+            img_grid = make_grid(
+                prepare_images(
+                    test_images, test_contralateral_images, highest_loss_indices
+                )
+            )
+            plt.figure(figsize=(20, 40))
+            plt.imshow(
+                img_grid[
+                    0,
+                    :,
+                ],
+                cmap="Greys",
+                # interpolation="nearest"
+            )
+            frame = plt.gca()
+            frame.axes.get_xaxis().set_visible(False)
+            frame.axes.get_yaxis().set_visible(False)
+            print("INDICES!!!!")
+            print(highest_loss_indices, lowest_loss_indices)
+            plt.savefig(Path(args.output_dir) / "highest_loss_images.pdf")
+            plt.savefig(Path(args.output_dir) / "highest_loss_images.png")
+            log_writer.add_image("highest_loss_images", img_grid)
+            img_grid = make_grid(
+                prepare_images(
+                    test_images, test_contralateral_images, lowest_loss_indices
+                )
+            )
+            plt.figure(figsize=(20, 40))
+            plt.imshow(
+                img_grid[
+                    0,
+                    :,
+                ],
+                cmap="Greys",
+                # interpolation="nearest"
+            )
+            frame = plt.gca()
+            frame.axes.get_xaxis().set_visible(False)
+            frame.axes.get_yaxis().set_visible(False)
+            plt.savefig(Path(args.output_dir) / "lowest_loss_images.pdf")
+            plt.savefig(Path(args.output_dir) / "lowest_loss_images.png")
+            log_writer.add_image("lowest_loss_images", img_grid)
             for key, value in test_stats.items():
                 log_writer.add_scalar(f"test/{key}", value, epoch)
             log_stats = {
@@ -402,7 +437,6 @@ def extract_and_save(model, dataset, num_workers, args, path, return_images=Fals
         durations,
         events,
         study_ids,
-        paths,
         images,
         contralateral_images,
     ) = extract_features_and_labels(
@@ -419,8 +453,8 @@ def extract_and_save(model, dataset, num_workers, args, path, return_images=Fals
             durations.cpu(),
             events.cpu(),
             study_ids.cpu(),
-            images.cpu(),
-            contralateral_images.cpu(),
+            [i.cpu() for i in images],
+            [i.cpu() for i in contralateral_images],
         ],
         path,
     )
@@ -536,8 +570,10 @@ def validate_network(
             raise RuntimeError("Loss is NaN!")
         if loss < lowest_loss:
             lowest_loss_indices = (lower, upper)
+            lowest_loss = loss
         if loss > highest_loss:
             highest_loss_indices = (lower, upper)
+            highest_loss = loss
 
         outputs += [output]
 
@@ -692,12 +728,6 @@ if __name__ == "__main__":
         We recommend tweaking the LR depending on the checkpoint evaluated.""",
     )
     parser.add_argument(
-        "--prescale",
-        default=1.0,
-        type=float,
-        help="""Only use PRESCALE percent of data (for development).""",
-    )
-    parser.add_argument(
         "--sample",
         default=None,
         type=float,
@@ -813,7 +843,7 @@ if __name__ == "__main__":
         )
 
         fit_datasets, test_dataset = get_datasets(
-            args.prescale,
+            1.0,
             train_transform,
             val_transform,
             test_metadata,
