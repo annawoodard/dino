@@ -11,7 +11,7 @@ def one_pair(x0, x1):
     return 1 + nn.LogSigmoid()(x1 - x0) / np.log(2.0)
 
 
-def calculate_lower_bound_rank_loss(pred, obs, event):
+def lower_bound_rank_loss(pred, obs, event):
     N = pred.size(0)
     # N x N
     all_pairs = one_pair(pred.view(N, 1), pred.view(1, N))
@@ -28,15 +28,19 @@ def calculate_lower_bound_rank_loss(pred, obs, event):
     return out.sum() / comparable_pair.sum()
 
 
-def calculate_mse_loss(pred, obs, event):
+def mse_loss(pred, obs, event):
     # for positive events, use vanilla MSE
     mse = event * ((pred - obs) ** 2)
 
+    return mse.mean()
+
+
+def penalty_loss(pred, obs, event):
     # for negative events (i.e. censored data points),
     # calculate MSE of events where pred < obs; error is
     # not defined when pred > obs
     p = (1 - event) * (pred < obs) * ((pred - obs) ** 2)
-    return mse.mean(), p.mean()
+    return p.mean()
 
 
 class DeepCENTLoss(torch.nn.Module):
@@ -47,17 +51,11 @@ class DeepCENTLoss(torch.nn.Module):
         self.lambda_p = lambda_p
         self.lambda_r = lambda_r
 
-    def calculate_rank_loss(self, predictions, observations, events):
-        return calculate_lower_bound_rank_loss(predictions, observations, events)
-
     def forward(self, predictions, observations, events):
-        mse_loss, penalty_loss = calculate_mse_loss(predictions, observations, events)
-        rank_loss = self.calculate_rank_loss(predictions, observations, events)
-
         return (
-            mse_loss,
-            self.lambda_p * penalty_loss,
-            -self.lambda_r * rank_loss,
+            mse_loss(predictions, observations, events),
+            self.lambda_p * penalty_loss(predictions, observations, events),
+            -self.lambda_r * lower_bound_rank_loss(predictions, observations, events),
         )
 
         #     for X_batch, y_batch, E_batch in test_loader:
