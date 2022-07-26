@@ -18,12 +18,19 @@ from sklearn.model_selection import train_test_split
 from timm.models.layers import to_2tuple
 from torch.utils.data import Dataset
 from torchvision import transforms
+from functools import lru_cache
 
 logger = logging.getLogger()
 
 
 @retry(tries=3, delay=1, backoff=2)
 def open_image(filename):
+    return Image.open(filename).convert("L")
+
+
+@retry(tries=3, delay=1, backoff=2)
+@lru_cache(maxsize=2**10)
+def cached_open_image(filename):
     return Image.open(filename).convert("L")
 
 
@@ -87,6 +94,63 @@ def log_summary(label, df):
     logger.info(table_text + "\n")
 
 
+class ChiMECRandomPatchSSLDataset(Dataset):
+    def __init__(
+        self,
+        transform,
+        exclude: pd.core.series.Series = None,
+        image_size: int = (2016, 3808),
+        patch_size: int = 224,
+        prescale: float = 1.0,
+    ):
+        metadata = pd.read_pickle(
+            "/gpfs/data/huo-lab/Image/annawoodard/maicara/data/interim/mammo_loose_cuts_v3/series_metadata.pkl"
+        )
+        # metadata passing all filters will have `np.nan` in the `filter` column
+        metadata = metadata[
+            (pd.isnull(metadata["filter"])) & (~pd.isnull(metadata["png_path"]))
+        ]
+        if exclude is not None:
+            original = metadata.exam_id.nunique()
+            metadata = metadata[~metadata["study_id"].isin(exclude)]
+            print(
+                f"dropped {original - metadata.exam_id.nunique()} exams from patients in the finetuning testing set"
+            )
+        if prescale:
+            # need to ensure we get some cases, even for small prescale values
+            cases = metadata[metadata.event == 1].sample(frac=min(prescale * 3, 1))
+            controls = metadata[metadata.event == 0].sample(frac=prescale)
+            metadata = pd.concat([cases, controls]).sample(frac=1)
+        self.metadata = metadata
+        log_summary("pretraining mammo\n\n", self.metadata)
+        self.image_size = to_2tuple(image_size)
+        self.resize_and_random_crop = transforms.Compose(
+            [transforms.Resize(self.image_size), transforms.RandomCrop(patch_size)]
+        )
+        self.transform = transform
+        self.patch_size = patch_size
+        w, h = self.image_size
+        self.num_patches = (w // patch_size) * (h // patch_size) * len(self.metadata)
+
+    def __len__(self) -> int:
+        return self.num_patches
+
+    def __getitem__(self, _: int) -> Tuple:
+        """Get item.
+
+        Args:
+            idx (int): Index in the metadata table to retrieve.
+
+        Returns:
+            Tuple of images:
+        """
+        series = self.metadata.iloc[np.random.randint(0, len(self.metadata))]
+        filename = series["png_path"]
+        # image = self.resize_and_random_crop(cached_open_image(filename))
+        image = self.resize_and_random_crop(open_image(filename))
+        return self.transform(image)
+
+
 class ChiMECSSLDataset(Dataset):
     def __init__(
         self,
@@ -138,7 +202,7 @@ class ChiMECSSLDataset(Dataset):
         """
         series = self.metadata.iloc[idx]
         filename = series["png_path"]
-        image = self.resize(load_png(filename))
+        image = self.resize(open_image(filename))
         return self.transform(image)
 
 
@@ -210,7 +274,7 @@ class ChiMECStackedSSLDataset(Dataset):
         """
         lateral_view_set = self.lateral_view_sets[idx]
         cc_view = self.resize(
-            load_png(
+            open_image(
                 self.metadata[
                     (self.metadata.lateral_view_set == lateral_view_set)
                     & (self.metadata.ViewPosition == "CC")
@@ -220,7 +284,7 @@ class ChiMECStackedSSLDataset(Dataset):
             )
         )
         mlo_view = self.resize(
-            load_png(
+            open_image(
                 self.metadata[
                     (self.metadata.lateral_view_set == lateral_view_set)
                     & (self.metadata.ViewPosition == "MLO")

@@ -36,7 +36,12 @@ import utils
 import vision_transformer as vits
 from vision_transformer import DINOHead
 
-from chimec import load_metadata, ChiMECSSLDataset, ChiMECStackedSSLDataset
+from chimec import (
+    load_metadata,
+    ChiMECSSLDataset,
+    ChiMECStackedSSLDataset,
+    ChiMECRandomPatchSSLDataset,
+)
 from maicara.data.constants import CHIMEC_MEAN, CHIMEC_STD
 from maicara.preprocessing.utils import log_code_state
 
@@ -233,6 +238,12 @@ def get_args_parser():
         When disabling multi-crop we recommend to use "--global_crops_scale 0.14 1." """,
     )
     parser.add_argument(
+        "--random_patch_size",
+        default=None,
+        type=int,
+        help="""Size in pixels to divide input image for patch-based training""",
+    )
+    parser.add_argument(
         "--local_crops_scale",
         type=float,
         nargs="+",
@@ -322,13 +333,23 @@ def train_dino(gpu, args):
         args.local_crops_number,
     )
     # TODO do not hardcode size
-    SSLDataset = ChiMECStackedSSLDataset if args.stack_views else ChiMECSSLDataset
-    dataset = SSLDataset(
-        transform,
-        exclude=test_metadata.study_id,
-        image_size=224,
-        prescale=args.prescale,
-    )
+    ChiMECRandomPatchSSLDataset,
+    if args.random_patch_size is None:
+        SSLDataset = ChiMECStackedSSLDataset if args.stack_views else ChiMECSSLDataset
+        dataset = SSLDataset(
+            transform,
+            exclude=test_metadata.study_id,
+            image_size=224,
+            prescale=args.prescale,
+        )
+    else:
+        dataset = ChiMECRandomPatchSSLDataset(
+            transform,
+            patch_size=args.random_patch_size,
+            exclude=test_metadata.study_id,
+            prescale=args.prescale,
+        )
+        utils.write_example_dino_augs(dataset, args.output_dir)
     sampler = torch.utils.data.DistributedSampler(dataset, shuffle=True)
     data_loader = torch.utils.data.DataLoader(
         dataset,

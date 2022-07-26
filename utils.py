@@ -36,8 +36,58 @@ import torch.distributed as dist
 from PIL import ImageFilter, ImageOps
 import git
 from pathlib import Path
+import matplotlib.pyplot as plt
+from torchvision.utils import make_grid
 
 logger = logging.getLogger()
+
+
+def write_example_dino_augs(
+    dataset, output_directory, num_examples=10, local_crops_number=8
+):
+    patch_lists = []
+    for i, entry in enumerate(dataset):
+        patch_lists.append(entry)
+        if i == num_examples:
+            break
+    rc = {
+        "axes.spines.left": False,
+        "axes.spines.right": False,
+        "axes.spines.bottom": False,
+        "axes.spines.top": False,
+        "axes.grid": False,
+        "xtick.bottom": False,
+        "xtick.labelbottom": False,
+        "ytick.labelleft": False,
+        "ytick.left": False,
+        "figure.facecolor": "white",
+        "axes.facecolor": "white",
+        "savefig.facecolor": "white",
+    }
+    plt.rcParams.update(rc)
+    f, axes = plt.subplots(11, 2, figsize=(20, 40))
+    axes[0][0].set_title("global views")
+    axes[0][1].set_title("local views", pad=65)
+    for i, patches in enumerate(patch_lists):
+        global_views = make_grid(patches[:2], nrow=2)[
+            0,
+            :,
+        ]
+        local_views = make_grid(patches[2:], nrow=local_crops_number)[
+            0,
+            :,
+        ]
+        axes[i][0].imshow(
+            global_views,
+            cmap="gray",
+        )
+        axes[i][1].imshow(
+            local_views,
+            cmap="gray",
+        )
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_directory, "augmentation_examples.png"))
+        plt.savefig(os.path.join(output_directory, "augmentation_examples.pdf"))
 
 
 def save(obj, path):
@@ -289,7 +339,7 @@ class SmoothedValue(object):
 
     def __init__(self, window_size=20, fmt=None):
         if fmt is None:
-            fmt = "{median:.3f} ({global_avg:.3f})"
+            fmt = "{median:.6f} ({global_avg:.6f})"
         self.deque = deque(maxlen=window_size)
         self.total = 0.0
         self.count = 0
