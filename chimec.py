@@ -1,4 +1,9 @@
 import os
+import itertools
+from tqdm import tqdm
+from functools import lru_cache
+import math
+import torch.distributed as dist
 import retry
 import logging
 import time
@@ -18,7 +23,6 @@ from sklearn.model_selection import train_test_split
 from timm.models.layers import to_2tuple
 from torch.utils.data import Dataset
 from torchvision import transforms
-from functools import lru_cache
 
 logger = logging.getLogger()
 
@@ -88,20 +92,33 @@ def log_summary(label, df):
     )
     label_width = len(label)
     padding = table_width - label_width - 1
-    logger.info(f"\n{label} {'*' * padding}")
-    logger.info(" " * 15 + "cases" + " " * 25 + "controls")
-    logger.info("_" * 32 + "  " + "_" * 32)
-    logger.info(table_text + "\n")
+    logger.info(
+        f"\n{label} {'*' * padding}\n"
+        + " " * 15
+        + "cases"
+        + " " * 25
+        + "controls\n"
+        + "_" * 32
+        + "  "
+        + "_" * 32
+        + "\n"
+        + table_text
+        + "\n"
+    )
 
 
-class ChiMECRandomPatchSSLDataset(Dataset):
+class ChiMECRandomTileSSLDataset(Dataset):
     def __init__(
         self,
         transform,
         exclude: pd.core.series.Series = None,
         image_size: int = (2016, 3808),
-        patch_size: int = 224,
+        tile_size: int = 224,
         prescale: float = 1.0,
+        max_frac_black: float = 0.96,
+        tiles_per_view: int = 10,
+        debug: bool = False,
+        views_per_epoch: int = 500,
     ):
         metadata = pd.read_pickle(
             "/gpfs/data/huo-lab/Image/annawoodard/maicara/data/interim/mammo_loose_cuts_v3/series_metadata.pkl"
@@ -117,25 +134,54 @@ class ChiMECRandomPatchSSLDataset(Dataset):
                 f"dropped {original - metadata.exam_id.nunique()} exams from patients in the finetuning testing set"
             )
         if prescale:
-            # need to ensure we get some cases, even for small prescale values
-            cases = metadata[metadata.event == 1].sample(frac=min(prescale * 3, 1))
-            controls = metadata[metadata.event == 0].sample(frac=prescale)
-            metadata = pd.concat([cases, controls]).sample(frac=1)
-        self.metadata = metadata
-        log_summary("pretraining mammo\n\n", self.metadata)
+            metadata = metadata.sample(frac=prescale)
+        if debug:
+            metadata = metadata[:512]
         self.image_size = to_2tuple(image_size)
-        self.resize_and_random_crop = transforms.Compose(
-            [transforms.Resize(self.image_size), transforms.RandomCrop(patch_size)]
-        )
+        self.crop = transforms.RandomCrop(tile_size)
         self.transform = transform
-        self.patch_size = patch_size
+        self.tile_size = tile_size
         w, h = self.image_size
-        self.num_patches = (w // patch_size) * (h // patch_size) * len(self.metadata)
+        self.max_frac_black = max_frac_black
+        self.tiles_per_view = tiles_per_view
+        self.size = len(metadata) * tiles_per_view
+        log_summary("pretraining mammo\n\n", metadata)
+        num_replicas = 1
+        rank = 1
+        if dist.is_available():
+            num_replicas = dist.get_world_size()
+            rank = dist.get_rank()
+        # num_samples = math.ceil((len(metadata) - num_replicas) / num_replicas)
+        total_size = len(metadata) * num_replicas
+        g = torch.Generator()
+        g.manual_seed(0)
+        indices = torch.randperm(len(metadata), generator=g).tolist()
+        # subset for rank
+        indices = indices[rank:total_size:num_replicas]
+        metadata = metadata.iloc[indices]
+        self.view_paths = itertools.cycle(metadata.png_path.tolist())
+        self.views_per_epoch = views_per_epoch
+        self.load_views()
+
+    def load_views(self):
+        start = time.time()
+        self.views = []
+        for fn in tqdm(
+            itertools.islice(self.view_paths, self.views_per_epoch),
+            total=self.views_per_epoch,
+        ):
+            self.views.append(open_image(fn))
+        # self.views = [open_image(fn) for fn in metadata.png_path]
+        logger.info(
+            "finished loading {} views in {:.0f}s".format(
+                self.views_per_epoch, time.time() - start
+            )
+        )
 
     def __len__(self) -> int:
-        return self.num_patches
+        return self.size
 
-    def __getitem__(self, _: int) -> Tuple:
+    def __getitem__(self, index: int) -> Tuple:
         """Get item.
 
         Args:
@@ -144,11 +190,17 @@ class ChiMECRandomPatchSSLDataset(Dataset):
         Returns:
             Tuple of images:
         """
-        series = self.metadata.iloc[np.random.randint(0, len(self.metadata))]
-        filename = series["png_path"]
-        # image = self.resize_and_random_crop(cached_open_image(filename))
-        image = self.resize_and_random_crop(open_image(filename))
-        return self.transform(image)
+        # series = self.metadata.iloc[index % len(self.metadata)]
+        # image = open_image(series.png_path)
+        image = self.views[index % self.views_per_epoch]
+        result = self.transform(self.crop(image))
+        frac_black = result[0][result[0] < 0.0].shape[0] / result[0].view(-1).shape[0]
+        while frac_black > self.max_frac_black:
+            result = self.transform(self.crop(image))
+            frac_black = (
+                result[0][result[0] < 0.0].shape[0] / result[0].view(-1).shape[0]
+            )
+        return result
 
 
 class ChiMECSSLDataset(Dataset):

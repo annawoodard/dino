@@ -35,15 +35,15 @@ from torchvision import models as torchvision_models
 import utils
 import vision_transformer as vits
 from vision_transformer import DINOHead
+import efficientformer
 
 from chimec import (
     load_metadata,
     ChiMECSSLDataset,
     ChiMECStackedSSLDataset,
-    ChiMECRandomPatchSSLDataset,
+    ChiMECRandomTileSSLDataset,
 )
 from maicara.data.constants import CHIMEC_MEAN, CHIMEC_STD
-from maicara.preprocessing.utils import log_code_state
 
 torchvision_archs = sorted(
     name
@@ -62,7 +62,15 @@ def get_args_parser():
         "--arch",
         default="vit_small",
         type=str,
-        choices=["vit_tiny", "vit_small", "vit_base", "xcit", "deit_tiny", "deit_small"]
+        choices=[
+            "vit_tiny",
+            "vit_small",
+            "vit_base",
+            "xcit",
+            "deit_tiny",
+            "deit_small",
+            "efficientformer_l3",
+        ]
         + torchvision_archs,
         # + torch.hub.list("facebookresearch/xcit:main"),
         help="""Name of architecture to train. For quick experiments with ViTs,
@@ -224,7 +232,8 @@ def get_args_parser():
         "--global_crops_scale",
         type=float,
         nargs="+",
-        default=(0.4, 1.0),
+        # default=(0.4, 1.0),
+        default=(0.6, 1.0),
         help="""Scale range of the cropped image before resizing, relatively to the origin image.
         Used for large global view cropping. When disabling multi-crop (--local_crops_number 0), we
         recommand using a wider range of scale ("--global_crops_scale 0.14 1." for example)""",
@@ -238,16 +247,23 @@ def get_args_parser():
         When disabling multi-crop we recommend to use "--global_crops_scale 0.14 1." """,
     )
     parser.add_argument(
-        "--random_patch_size",
+        "--tile_size",
         default=None,
         type=int,
-        help="""Size in pixels to divide input image for patch-based training""",
+        help="""Size in pixels to divide input image for tile-based training""",
+    )
+    parser.add_argument(
+        "--local_crops_size",
+        default=96,
+        type=int,
+        help="""Size in pixels of each local crop""",
     )
     parser.add_argument(
         "--local_crops_scale",
         type=float,
         nargs="+",
-        default=(0.05, 0.4),
+        # default=(0.05, 0.4),
+        default=(0.3, 0.6),
         help="""Scale range of the cropped image before resizing, relatively to the origin image.
         Used for small local view cropping of multi-crop.""",
     )
@@ -280,6 +296,12 @@ def get_args_parser():
         type=utils.bool_flag,
         default=False,
         help="""Whether or not to stack CC and MLO views in the color channel""",
+    )
+    parser.add_argument(
+        "--debug",
+        type=utils.bool_flag,
+        default=False,
+        help="""Run with small debug dataset""",
     )
     parser.add_argument(
         "--dist_url",
@@ -323,43 +345,6 @@ def train_dino(gpu, args):
         "\n".join("%s: %s" % (k, str(v)) for k, v in sorted(dict(vars(args)).items()))
     )
 
-    # ============ preparing data ... ============
-    # exclude any patients in testing set from pretraining set
-    # fit = val + train sets
-    fit_metadata, test_metadata = load_metadata(args.test_size)
-    transform = DataAugmentationDINO(
-        args.global_crops_scale,
-        args.local_crops_scale,
-        args.local_crops_number,
-    )
-    # TODO do not hardcode size
-    ChiMECRandomPatchSSLDataset,
-    if args.random_patch_size is None:
-        SSLDataset = ChiMECStackedSSLDataset if args.stack_views else ChiMECSSLDataset
-        dataset = SSLDataset(
-            transform,
-            exclude=test_metadata.study_id,
-            image_size=224,
-            prescale=args.prescale,
-        )
-    else:
-        dataset = ChiMECRandomPatchSSLDataset(
-            transform,
-            patch_size=args.random_patch_size,
-            exclude=test_metadata.study_id,
-            prescale=args.prescale,
-        )
-        utils.write_example_dino_augs(dataset, args.output_dir)
-    sampler = torch.utils.data.DistributedSampler(dataset, shuffle=True)
-    data_loader = torch.utils.data.DataLoader(
-        dataset,
-        sampler=sampler,
-        batch_size=args.batch_size_per_gpu,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        drop_last=True,
-    )
-
     # ============ building student and teacher networks ... ============
     # we changed the name DeiT-S for ViT-S to avoid confusions
     args.arch = args.arch.replace("deit", "vit")
@@ -380,8 +365,18 @@ def train_dino(gpu, args):
         student = torchvision_models.__dict__[args.arch](in_chans=in_chans)
         teacher = torchvision_models.__dict__[args.arch](in_chans=in_chans)
         embed_dim = student.fc.weight.shape[1]
+    elif args.arch in efficientformer.__dict__.keys():
+        student = efficientformer.__dict__[args.arch](in_chans=in_chans)
+        teacher = efficientformer.__dict__[args.arch](in_chans=in_chans)
+        embed_dim = student.embed_dims[-1]
+
     else:
         logger.error(f"Unknow architecture: {args.arch}")
+    logger.info(
+        "number of parameters: {:d}".format(
+            sum(p.numel() for p in student.parameters() if p.requires_grad)
+        )
+    )
 
     # multi-crop wrapper handles forward with inputs of different resolutions
     student = utils.MultiCropWrapper(
@@ -445,6 +440,64 @@ def train_dino(gpu, args):
     if args.use_fp16:
         fp16_scaler = torch.cuda.amp.GradScaler()
 
+    # ============ optionally resume training ... ============
+    to_restore = {
+        "epoch": 0,
+        "fit_metadata": None,
+        "test_metadata": None,
+    }
+    utils.restart_from_checkpoint(
+        os.path.join(args.output_dir, "checkpoint.pth"),
+        restore_objects=to_restore,
+        student=student,
+        teacher=teacher,
+        optimizer=optimizer,
+        fp16_scaler=fp16_scaler,
+        dino_loss=dino_loss,
+    )
+    start_epoch = to_restore["epoch"]
+    fit_metadata = to_restore["fit_metadata"]
+    test_metadata = to_restore["test_metadata"]
+
+    # ============ preparing data ... ============
+    # exclude any patients in testing set from pretraining set
+    # fit = val + train sets
+    if fit_metadata is None:
+        fit_metadata, test_metadata = load_metadata(args.test_size)
+    transform = DataAugmentationDINO(
+        args.global_crops_scale,
+        args.local_crops_scale,
+        args.local_crops_number,
+        args.local_crops_size,
+    )
+    # TODO do not hardcode size
+    if args.tile_size is None:
+        SSLDataset = ChiMECStackedSSLDataset if args.stack_views else ChiMECSSLDataset
+        dataset = SSLDataset(
+            transform,
+            exclude=test_metadata.study_id,
+            image_size=224,
+            prescale=args.prescale,
+        )
+    else:
+        dataset = ChiMECRandomTileSSLDataset(
+            transform,
+            tile_size=args.tile_size,
+            exclude=test_metadata.study_id,
+            prescale=args.prescale,
+            debug=args.debug,
+        )
+        utils.write_example_dino_augs(dataset, args.output_dir)
+    sampler = torch.utils.data.DistributedSampler(dataset, shuffle=True)
+    data_loader = torch.utils.data.DataLoader(
+        dataset,
+        sampler=sampler,
+        batch_size=args.batch_size_per_gpu,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        drop_last=True,
+    )
+
     # ============ init schedulers ... ============
     lr_schedule = utils.cosine_scheduler(
         args.lr
@@ -466,25 +519,6 @@ def train_dino(gpu, args):
         args.momentum_teacher, 1, args.epochs, len(data_loader)
     )
     logger.info(f"Loss, optimizer and schedulers ready.")
-
-    # ============ optionally resume training ... ============
-    to_restore = {
-        "epoch": 0,
-        "fit_metadata": fit_metadata,
-        "test_metadata": test_metadata,
-    }
-    utils.restart_from_checkpoint(
-        os.path.join(args.output_dir, "checkpoint.pth"),
-        restore_objects=to_restore,
-        student=student,
-        teacher=teacher,
-        optimizer=optimizer,
-        fp16_scaler=fp16_scaler,
-        dino_loss=dino_loss,
-    )
-    start_epoch = to_restore["epoch"]
-    fit_metadata = to_restore["fit_metadata"]
-    test_metadata = to_restore["test_metadata"]
 
     early_stopping = utils.EarlyStopping(patience=args.patience)
 
@@ -509,6 +543,8 @@ def train_dino(gpu, args):
             args,
             logger,
         )
+        if args.tile_size is not None:
+            dataset.load_views()
         early_stopping(train_stats["loss"])
         if early_stopping.early_stop:
             break
@@ -691,7 +727,13 @@ class DINOLoss(nn.Module):
 
 
 class DataAugmentationDINO(object):
-    def __init__(self, global_crops_scale, local_crops_scale, local_crops_number):
+    def __init__(
+        self,
+        global_crops_scale,
+        local_crops_scale,
+        local_crops_number,
+        local_crops_size,
+    ):
         flip_and_color_jitter = transforms.Compose(
             [
                 transforms.RandomHorizontalFlip(p=0.5),
@@ -741,7 +783,9 @@ class DataAugmentationDINO(object):
         self.local_transfo = transforms.Compose(
             [
                 transforms.RandomResizedCrop(
-                    96, scale=local_crops_scale, interpolation=Image.BICUBIC
+                    local_crops_size,
+                    scale=local_crops_scale,
+                    interpolation=Image.BICUBIC,
                 ),
                 flip_and_color_jitter,
                 utils.GaussianBlur(p=0.5),
@@ -769,6 +813,7 @@ if __name__ == "__main__":
         args.world_size = len(args.devices)
     args.port = str(utils.get_unused_local_port())
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+    utils.log_code_state(args.output_dir)
     mp.spawn(
         train_dino,
         nprocs=len(args.devices),
