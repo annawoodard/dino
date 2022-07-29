@@ -31,6 +31,7 @@ import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
 from torchvision import datasets, transforms
 from torchvision import models as torchvision_models
+from torch.utils.tensorboard import SummaryWriter
 
 import utils
 import vision_transformer as vits
@@ -530,13 +531,16 @@ def train_dino(gpu, args):
 
     early_stopping = utils.EarlyStopping(patience=args.patience)
 
+    log_writer = SummaryWriter(os.path.join(args.output_dir, "logs"))
+
+    # TODO add to checkpoint
     start_time = time.time()
     logger.info("Starting DINO training!")
     for epoch in range(start_epoch, args.epochs):
         data_loader.sampler.set_epoch(epoch)
 
         # ============ training one epoch of DINO ... ============
-        train_stats = train_one_epoch(
+        train_stats, last_teacher_output, last_student_output = train_one_epoch(
             student,
             teacher,
             teacher_without_ddp,
@@ -581,8 +585,16 @@ def train_dino(gpu, args):
             "epoch": epoch,
         }
         if utils.is_main_process():
+            for key, value in train_stats.items():
+                log_writer.add_scalar(f"train/{key}", value, epoch)
             with (Path(args.output_dir) / "log.txt").open("a") as f:
                 f.write(json.dumps(log_stats) + "\n")
+            log_writer.add_histogram(
+                "teacher_representation", last_teacher_output, epoch
+            )
+            log_writer.add_histogram(
+                "student_representation", last_student_output, epoch
+            )
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     logger.info("Training time {}".format(total_time_str))
@@ -662,7 +674,11 @@ def train_one_epoch(
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     logger.info("Averaged stats: %s", metric_logger)
-    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+    return (
+        {k: meter.global_avg for k, meter in metric_logger.meters.items()},
+        teacher_output,
+        student_output,
+    )
 
 
 class DINOLoss(nn.Module):
