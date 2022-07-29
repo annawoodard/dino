@@ -17,29 +17,56 @@ Misc functions.
 Mostly copy-paste from torchvision references or other public repos like DETR:
 https://github.com/facebookresearch/detr/blob/master/util/misc.py
 """
+import datetime
+import logging
+import math
 import os
+import random
+import socket
+import subprocess
 import sys
 import time
-import math
-import random
-import datetime
-import subprocess
 from collections import defaultdict, deque
-import socket
-
-import logging
-
-import numpy as np
-import torch
-from torch import nn
-import torch.distributed as dist
-from PIL import ImageFilter, ImageOps
-import git
 from pathlib import Path
+from typing import Callable, Dict, Optional, Tuple, Union
+
+import git
 import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import pydicom
+import torch
+import torch.distributed as dist
+from PIL import Image, ImageFilter, ImageOps
+from sklearn.model_selection import train_test_split
+from torch import nn
 from torchvision.utils import make_grid
 
 logger = logging.getLogger()
+
+
+def get_dicom(path):
+    f = pydicom.dcmread(path)
+    return Image.fromarray(f.pixel_array).convert("L")
+
+
+def stratified_group_split(
+    # adapted from https://stackoverflow.com/a/64663756/5111510
+    samples: pd.DataFrame,
+    group: str,
+    stratify_by: str,
+    test_size: float,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    groups = samples[group].drop_duplicates()
+    stratify = samples.drop_duplicates(group)[stratify_by].to_numpy()
+    groups_train, groups_test = train_test_split(
+        groups, stratify=stratify, test_size=test_size
+    )
+
+    samples_train = samples.loc[lambda d: d[group].isin(groups_train)]
+    samples_test = samples.loc[lambda d: d[group].isin(groups_test)]
+
+    return samples_train, samples_test
 
 
 def write_example_dino_augs(
@@ -65,7 +92,7 @@ def write_example_dino_augs(
         "savefig.facecolor": "white",
     }
     plt.rcParams.update(rc)
-    f, axes = plt.subplots(11, 2, figsize=(20, 40))
+    f, axes = plt.subplots(num_examples + 1, 2, figsize=(20, 40))
     axes[0][0].set_title("global views")
     axes[0][1].set_title("local views", pad=65)
     for i, patches in enumerate(patch_lists):

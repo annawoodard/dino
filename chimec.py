@@ -2,7 +2,6 @@ import os
 import itertools
 from tqdm import tqdm
 from functools import lru_cache
-import math
 import torch.distributed as dist
 import retry
 import logging
@@ -16,13 +15,13 @@ import numpy as np
 import pandas as pd
 import tabulate
 import torch
-from maicara.preprocessing.utils import EmptyCrop
 from sklearn.model_selection import StratifiedGroupKFold
 from PIL import Image
-from sklearn.model_selection import train_test_split
 from timm.models.layers import to_2tuple
 from torch.utils.data import Dataset
 from torchvision import transforms
+
+from utils import stratified_group_split
 
 logger = logging.getLogger()
 
@@ -36,25 +35,6 @@ def open_image(filename):
 @lru_cache(maxsize=2**10)
 def cached_open_image(filename):
     return Image.open(filename).convert("L")
-
-
-def stratified_group_split(
-    # adapted from https://stackoverflow.com/a/64663756/5111510
-    samples: pd.DataFrame,
-    group: str,
-    stratify_by: str,
-    test_size: float,
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    groups = samples[group].drop_duplicates()
-    stratify = samples.drop_duplicates(group)[stratify_by].to_numpy()
-    groups_train, groups_test = train_test_split(
-        groups, stratify=stratify, test_size=test_size
-    )
-
-    samples_train = samples.loc[lambda d: d[group].isin(groups_train)]
-    samples_test = samples.loc[lambda d: d[group].isin(groups_test)]
-
-    return samples_train, samples_test
 
 
 def worker_init_fn(worker_id):
@@ -116,7 +96,7 @@ class ChiMECRandomTileSSLDataset(Dataset):
         tile_size: int = 224,
         prescale: float = 1.0,
         max_frac_black: float = 0.96,
-        tiles_per_view: int = 10,
+        tiles_per_view: int = 20,
         debug: bool = False,
         views_per_epoch: int = 500,
     ):
@@ -159,7 +139,7 @@ class ChiMECRandomTileSSLDataset(Dataset):
         # subset for rank
         indices = indices[rank:total_size:num_replicas]
         metadata = metadata.iloc[indices]
-        self.view_paths = itertools.cycle(metadata.png_path.tolist())
+        self.view_paths = itertools.cycle(metadata.png_path.sample(frac=1.0).tolist())
         self.views_per_epoch = views_per_epoch
         self.load_views()
 

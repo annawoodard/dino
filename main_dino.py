@@ -233,10 +233,19 @@ def get_args_parser():
         type=float,
         nargs="+",
         # default=(0.4, 1.0),
-        default=(0.6, 1.0),
+        default=(0.5, 1.0),
         help="""Scale range of the cropped image before resizing, relatively to the origin image.
         Used for large global view cropping. When disabling multi-crop (--local_crops_number 0), we
         recommand using a wider range of scale ("--global_crops_scale 0.14 1." for example)""",
+    )
+    parser.add_argument(
+        "--local_crops_scale",
+        type=float,
+        nargs="+",
+        # default=(0.05, 0.4),
+        default=(0.1, 0.5),
+        help="""Scale range of the cropped image before resizing, relatively to the origin image.
+        Used for small local view cropping of multi-crop.""",
     )
     parser.add_argument(
         "--local_crops_number",
@@ -257,15 +266,6 @@ def get_args_parser():
         default=96,
         type=int,
         help="""Size in pixels of each local crop""",
-    )
-    parser.add_argument(
-        "--local_crops_scale",
-        type=float,
-        nargs="+",
-        # default=(0.05, 0.4),
-        default=(0.3, 0.6),
-        help="""Scale range of the cropped image before resizing, relatively to the origin image.
-        Used for small local view cropping of multi-crop.""",
     )
 
     # Misc
@@ -362,8 +362,16 @@ def train_dino(gpu, args):
         embed_dim = student.embed_dim
     # otherwise, we check if the architecture is in torchvision models
     elif args.arch in torchvision_models.__dict__.keys():
-        student = torchvision_models.__dict__[args.arch](in_chans=in_chans)
-        teacher = torchvision_models.__dict__[args.arch](in_chans=in_chans)
+        student = torchvision_models.__dict__[args.arch]()
+        teacher = torchvision_models.__dict__[args.arch]()
+        if "resnet" in args.arch:
+            # make grayscale
+            student.conv1 = nn.Conv2d(
+                1, 64, kernel_size=7, stride=2, padding=3, bias=False
+            )
+            teacher.conv1 = nn.Conv2d(
+                1, 64, kernel_size=7, stride=2, padding=3, bias=False
+            )
         embed_dim = student.fc.weight.shape[1]
     elif args.arch in efficientformer.__dict__.keys():
         student = efficientformer.__dict__[args.arch](in_chans=in_chans)
