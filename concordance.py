@@ -18,9 +18,9 @@ def td_concordance_index(pred, obs, event):
     Håvard Kvamme and Ørnulf Borgan. Continuous and discrete-time survival prediction with neural networks. arXiv preprint arXiv:1910.06724, 2019.
 
     Arguments:
-        durations {np.array[n]} -- Event times (or censoring times.)
-        events {np.array[n]} -- Event indicators (0 is censoring).
-        surv {np.array[n_times, n]} -- Survival function (each row is a duraratoin, and each col
+        obs {torch.Tensor[n]} -- Event times (or censoring times.)
+        event {torch.Tensor[n]} -- Event indicators (0 is censoring).
+        pred {torch.Tensor[n_times, n]} -- Predicted time-to-event (each row is a duration, and each col
             is an individual).
 
     Returns:
@@ -73,6 +73,6 @@ def td_concordance_index(pred, obs, event):
         return out.sum() / comparable_pair.sum()
     except ZeroDivisionError:
         print(
-            "The c-index is not well-defined if there are no positive examples; returning c-index=-1"
+            "The c-index is not well-defined if there are no comparable pairs; returning c-index=-1"
         )
         return -1.0
