@@ -99,7 +99,8 @@ class GridTile(Transform):
         if self.max_frac_black:
             tiled_image, locations = self.filter_threshold(tiled_image, locations)
 
-        return torch.Tensor(tiled_image), torch.Tensor(locations)
+        # return torch.Tensor(tiled_image), torch.Tensor(locations)
+        return torch.Tensor(tiled_image)
 
 
 class RandGridTile(GridTile, RandomizableTransform):

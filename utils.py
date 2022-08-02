@@ -18,6 +18,8 @@ Mostly copy-paste from torchvision references or other public repos like DETR:
 https://github.com/facebookresearch/detr/blob/master/util/misc.py
 """
 import datetime
+import argparse
+import warnings
 import logging
 import math
 import os
@@ -41,11 +43,18 @@ from PIL import Image, ImageFilter, ImageOps
 from sklearn.model_selection import train_test_split
 from torch import nn
 from torchvision.utils import make_grid
+from functools import lru_cache
 
 logger = logging.getLogger()
 
 
 def get_dicom(path):
+    f = pydicom.dcmread(path)
+    return Image.fromarray(f.pixel_array).convert("L")
+
+
+@lru_cache(maxsize=None)
+def cached_get_dicom(path):
     f = pydicom.dcmread(path)
     return Image.fromarray(f.pixel_array).convert("L")
 
@@ -731,7 +740,7 @@ def _no_grad_trunc_normal_(tensor, mean, std, a, b):
 
 
 def trunc_normal_(tensor, mean=0.0, std=1.0, a=-2.0, b=2.0):
-    # type: (Tensor, float, float, float, float) -> Tensor
+    # type: (torch.Tensor, float, float, float, float) -> torch.Tensor
     return _no_grad_trunc_normal_(tensor, mean, std, a, b)
 
 

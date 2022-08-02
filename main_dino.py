@@ -32,6 +32,7 @@ import torch.nn.functional as F
 from torchvision import datasets, transforms
 from torchvision import models as torchvision_models
 from torch.utils.tensorboard import SummaryWriter
+from cmmd import CMMDRandomTileDataset
 
 import utils
 import vision_transformer as vits
@@ -225,6 +226,13 @@ def get_args_parser():
         help="""Type of optimizer. We recommend using adamw with ViTs.""",
     )
     parser.add_argument(
+        "--dataset",
+        default="chimec",
+        type=str,
+        choices=["chimec", "cmmd"],
+        help="""Dataset to use.""",
+    )
+    parser.add_argument(
         "--drop_path_rate", type=float, default=0.1, help="stochastic depth rate"
     )
 
@@ -328,7 +336,7 @@ def get_args_parser():
         help="which devices to use on local machine",
     )
     parser.add_argument(
-        "--saveckp_freq", default=50, type=int, help="Save checkpoint every x epochs."
+        "--saveckp_freq", default=10, type=int, help="Save checkpoint every x epochs."
     )
     return parser
 
@@ -471,8 +479,6 @@ def train_dino(gpu, args):
     # ============ preparing data ... ============
     # exclude any patients in testing set from pretraining set
     # fit = val + train sets
-    if fit_metadata is None:
-        fit_metadata, test_metadata = load_metadata(args.test_size)
     transform = DataAugmentationDINO(
         args.global_crops_scale,
         args.local_crops_scale,
@@ -480,23 +486,33 @@ def train_dino(gpu, args):
         args.local_crops_size,
     )
     # TODO do not hardcode size
-    if args.tile_size is None:
-        SSLDataset = ChiMECStackedSSLDataset if args.stack_views else ChiMECSSLDataset
-        dataset = SSLDataset(
-            transform,
-            exclude=test_metadata.study_id,
-            image_size=224,
-            prescale=args.prescale,
+    if args.dataset == "chimec":
+        if fit_metadata is None:
+            fit_metadata, test_metadata = load_metadata(args.test_size)
+        if args.tile_size is None:
+            SSLDataset = (
+                ChiMECStackedSSLDataset if args.stack_views else ChiMECSSLDataset
+            )
+            dataset = SSLDataset(
+                transform,
+                exclude=test_metadata.study_id,
+                image_size=224,
+                prescale=args.prescale,
+            )
+        else:
+            dataset = ChiMECRandomTileSSLDataset(
+                transform,
+                tile_size=args.tile_size,
+                exclude=test_metadata.study_id,
+                prescale=args.prescale,
+                debug=args.debug,
+            )
+    elif args.dataset == "cmmd":
+        transform = transforms.Compose(
+            [transforms.RandomCrop(args.tile_size), transform]
         )
-    else:
-        dataset = ChiMECRandomTileSSLDataset(
-            transform,
-            tile_size=args.tile_size,
-            exclude=test_metadata.study_id,
-            prescale=args.prescale,
-            debug=args.debug,
-        )
-        utils.write_example_dino_augs(dataset, args.output_dir)
+        dataset = CMMDRandomTileDataset(transform=transform)
+    utils.write_example_dino_augs(dataset, args.output_dir)
     sampler = torch.utils.data.DistributedSampler(dataset, shuffle=True)
     data_loader = torch.utils.data.DataLoader(
         dataset,
@@ -555,7 +571,7 @@ def train_dino(gpu, args):
             args,
             logger,
         )
-        if args.tile_size is not None:
+        if (args.tile_size != None) and (args.dataset == "chimec"):
             dataset.load_views()
         early_stopping(train_stats["loss"])
         if early_stopping.early_stop:

@@ -1,4 +1,6 @@
 import argparse
+import torch.nn.functional as F
+import torchmetrics
 import sys
 from torchvision import models as torchvision_models
 import matplotlib.pyplot as plt
@@ -41,7 +43,7 @@ def train_mil(gpu, result_queue, fold_queue, args):
     cudnn.benchmark = True
     while fold_queue.qsize() > 0:
         fold = fold_queue.get()
-        logger = utils.setup_logging(args.output_dir, f"train_mil{fold}")
+        logger = utils.setup_logging(args.output_dir, f"fold_{fold}")
         logger.info(f"Processing fold {fold} on gpu {gpu}")
         logger.info(
             "\n".join(
@@ -54,7 +56,7 @@ def train_mil(gpu, result_queue, fold_queue, args):
             )
         )
 
-        datasets = torch.load(os.path.join(args.features_dir, "datasets.pth.tar"))
+        datasets = torch.load(os.path.join(args.output_dir, "datasets.pth.tar"))
         fit_datasets = datasets["fit_datasets"]
         test_dataset = datasets["test_dataset"]
         train_dataset, val_dataset = fit_datasets[fold if fold is not None else 0]
@@ -64,11 +66,9 @@ def train_mil(gpu, result_queue, fold_queue, args):
         if fold == None:
             # before evaluating the testing dataset we train with all fit data
             fit_dataset = train_dataset + val_dataset
-            return_images = True
         else:
             fit_dataset = train_dataset
             test_dataset = val_dataset
-            return_images = False
 
         fit_loader = torch.utils.data.DataLoader(
             fit_dataset,
@@ -158,7 +158,13 @@ def train_mil(gpu, result_queue, fold_queue, args):
         early_stopping = utils.EarlyStopping(patience=args.patience)
         for epoch in range(0, args.epochs):
             train_stats = train(
-                model, optimizer, fit_loader, epoch, args.batch_size, args.avgpool
+                model,
+                optimizer,
+                fit_loader,
+                epoch,
+                args.batch_size,
+                args.avgpool_patchtokens,
+                args.arch,
             )
             scheduler.step()
 
@@ -187,7 +193,7 @@ def train_mil(gpu, result_queue, fold_queue, args):
                     if args.early_stop and early_stopping.early_stop:
                         break
                     logger.info(
-                        f"Concordance index at epoch {epoch} of the network on the {len(val_dataset)} test images: {val_stats['acc']:.3f}"
+                        f"Accuracy at epoch {epoch} of the network on the {len(val_dataset)} test images: {val_stats['acc']:.3f}"
                     )
                     # if best_c_index < val_stats["c_index"]:
                     #     best_c_index = val_stats["c_index"]
@@ -209,7 +215,7 @@ def train_mil(gpu, result_queue, fold_queue, args):
                 args.arch,
             )
             logger.info(
-                f"Accuracy of the model trained with (train + val) datasets on the {len(test_metadata)} test views: {test_stats['acc']:.3f}"
+                f"Accuracy of the model trained with (train + val) datasets on the {len(test_loader)} test views: {test_stats['acc']:.3f}"
             )
 
             for key, value in test_stats.items():
@@ -239,19 +245,19 @@ def train_mil(gpu, result_queue, fold_queue, args):
         result_queue.put(result)
 
 
-def train(model, optimizer, loader, epoch, n, avgpool):
+def train(model, optimizer, loader, epoch, n, avgpool, arch):
     model.train()
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter("lr", utils.SmoothedValue(window_size=1, fmt="{value:.6f}"))
     header = "Epoch: [{}]".format(epoch)
+    acc = torchmetrics.Accuracy(num_classes=2).cuda()
     for (inp, target) in metric_logger.log_every(loader, 20, header):
-        # move to gpu
         inp = inp.cuda(non_blocking=True)
         target = target.cuda(non_blocking=True)
 
         # forward
         # with torch.no_grad():
-        if "vit" in args.arch:
+        if "vit" in arch:
             intermediate_output = model.net.get_intermediate_layers(inp, n)
             output = torch.cat([x[:, 0] for x in intermediate_output], dim=-1)
             if avgpool:
@@ -268,6 +274,7 @@ def train(model, optimizer, loader, epoch, n, avgpool):
 
         # compute cross entropy loss
         loss = nn.CrossEntropyLoss()(output, target)
+        acc.update(output, target)
         if torch.isnan(loss):
             raise RuntimeError("Loss is NaN!")
 
@@ -282,6 +289,8 @@ def train(model, optimizer, loader, epoch, n, avgpool):
         # torch.cuda.synchronize()
         metric_logger.update(loss=loss.item())
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
+    acc = acc.compute()
+    metric_logger.update(acc=acc.item())
     # gather the stats from all processes
     # metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
@@ -293,9 +302,12 @@ def validate_network(val_loader, model, n, avgpool, arch):
     model.eval()
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = "Test:"
+    auc = torchmetrics.AUROC(num_classes=2).cuda()
+    acc = torchmetrics.Accuracy(num_classes=2).cuda()
     for inp, target in metric_logger.log_every(val_loader, 20, header):
         inp = inp.cuda(non_blocking=True)
         target = target.cuda(non_blocking=True)
+        one_hot_target = F.one_hot(target, num_classes=2)
 
         with torch.no_grad():
             if "vit" in arch:
@@ -316,17 +328,17 @@ def validate_network(val_loader, model, n, avgpool, arch):
                 output = model(inp)
         loss = nn.CrossEntropyLoss()(output, target)
 
-        (acc,) = utils.accuracy(output, target, topk=(1,))
+        auc.update(output, one_hot_target)
+        acc.update(output, target)
 
-        batch_size = inp.shape[0]
         metric_logger.update(loss=loss.item())
-        metric_logger.meters["acc"].update(acc.item(), n=batch_size)
-    # TODO
-    # for key, value in aucs.items():
-    #     metric_logger.update(**{key: value})
+    auc = auc.compute()
+    acc = acc.compute()
+    metric_logger.update(auc=auc.item())
+    metric_logger.update(acc=acc.item())
     print(
-        "* Accuracy {acc.global_avg:.3f} loss {losses.global_avg:.3f}".format(
-            acc=metric_logger.acc, losses=metric_logger.loss
+        "* accuracy {acc.global_avg:.3f} loss {losses.global_avg:.3f} auc {auc.global_avg:.3f}".format(
+            acc=metric_logger.acc, losses=metric_logger.loss, auc=metric_logger.auc
         )
     )
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
@@ -336,6 +348,12 @@ if __name__ == "__main__":
     start = time.time()
     parser = argparse.ArgumentParser("Train model")
     parser.add_argument("--seed", default=None, type=int, help="Random seed.")
+    parser.add_argument(
+        "--prescale",
+        default=1.0,
+        type=float,
+        help="""Only use PRESCALE percent of data (for development).""",
+    )
     parser.add_argument(
         "--n_last_blocks",
         default=4,
@@ -363,7 +381,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--early_stop",
-        default=False,
+        default=True,
         type=utils.bool_flag,
         help="""Enable early stopping.""",
     )
@@ -390,11 +408,11 @@ if __name__ == "__main__":
         help='Key to use in the checkpoint (example: "teacher")',
     )
     parser.add_argument(
-        "--epochs", default=100, type=int, help="Number of epochs of training."
+        "--epochs", default=20, type=int, help="Number of epochs of training."
     )
     parser.add_argument(
         "--patience",
-        default=10,
+        default=5,
         type=int,
         help="How many epochs to wait before stopping when val loss is not improving",
     )
@@ -457,11 +475,9 @@ if __name__ == "__main__":
         type=utils.bool_flag,
     )
     parser.add_argument(
-        "--features_dir", default=".", help="Path to checkpoint features"
-    )
-    parser.add_argument(
         "--tile_size",
-        default=None,
+        default=(224, 224),
+        nargs="+",
         type=int,
         help="""Size in pixels to divide input image for tile-based training""",
     )
@@ -490,15 +506,10 @@ if __name__ == "__main__":
         args.world_size = len(args.devices)
     args.port = str(utils.get_unused_local_port())
     args.output_dir = utils.prepare_output_dir(args.output_dir, args.autolabel)
-    Path(args.features_dir).mkdir(parents=True, exist_ok=True)
-    state_dict = torch.load(args.pretrained_weights, map_location="cpu")
-    in_chans = state_dict.pop("in_chans")
-    fit_metadata = state_dict.pop("fit_metadata")
-    test_metadata = state_dict.pop("test_metadata")
     utils.log_code_state(args.output_dir)
 
-    logger = utils.setup_logging(args.output_dir, f"train_mil")
-    if not os.path.isfile(os.path.join(args.features_dir, "datasets.pth.tar")):
+    logger = utils.setup_logging(args.output_dir, f"fold_")
+    if not os.path.isfile(os.path.join(args.output_dir, "datasets.pth.tar")):
         val_transform = pth_transforms.Compose(
             [
                 pth_transforms.ToTensor(),
@@ -516,7 +527,7 @@ if __name__ == "__main__":
         )
 
         fit_datasets, test_dataset = get_datasets(
-            1.0,
+            args.prescale,
             train_transform,
             val_transform,
             args.folds,
@@ -524,12 +535,12 @@ if __name__ == "__main__":
         )
         torch.save(
             {"fit_datasets": fit_datasets, "test_dataset": test_dataset},
-            os.path.join(args.features_dir, "datasets.pth.tar"),
+            os.path.join(args.output_dir, "datasets.pth.tar"),
         )
         logger.info(f"Data loaded")
         for i, (train_dataset, val_dataset) in enumerate(fit_datasets):
             logger.info(
-                f"Fold {i}: {len(train_dataset)} training exams and {len(val_dataset)} val exams"
+                f"Fold {i}: {len(train_dataset)} training views and {len(val_dataset)} val views"
             )
 
     # We may not have a matching number of folds and GPUs
@@ -545,7 +556,7 @@ if __name__ == "__main__":
     mp.spawn(
         train_mil,
         nprocs=len(args.devices),
-        args=(result_queue, fold_queue, in_chans, args),
+        args=(result_queue, fold_queue, args),
         join=True,
     )
     results = [result_queue.get() for i in range(result_queue.qsize())]

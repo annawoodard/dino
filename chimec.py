@@ -173,20 +173,14 @@ class ChiMECRandomTileSSLDataset(Dataset):
         # series = self.metadata.iloc[index % len(self.metadata)]
         # image = open_image(series.png_path)
         image = self.views[index % self.views_per_epoch]
-        result = self.transform(self.crop(image))
-        first_crop = result[0]
-        frac_black = (
-            first_crop[first_crop == first_crop.min()].view(-1).shape[0]
-            / first_crop.view(-1).shape[0]
-        )
+        tile = self.crop(image)
+        frac_black = tile[tile == tile.min()].view(-1).shape[0] / tile.view(-1).shape[0]
         while frac_black > self.max_frac_black:
-            result = self.transform(self.crop(image))
-            first_crop = result[0]
+            tile = self.crop(image)
             frac_black = (
-                first_crop[first_crop == first_crop.min()].view(-1).shape[0]
-                / first_crop.view(-1).shape[0]
+                tile[tile == tile.min()].view(-1).shape[0] / tile.view(-1).shape[0]
             )
-        return result
+        return self.transform(tile)
 
 
 class ChiMECSSLDataset(Dataset):

@@ -1,4 +1,5 @@
 import os
+import torchvision.transforms.functional as F
 import numpy as np
 import glob
 import pydicom
@@ -21,7 +22,7 @@ from timm.models.layers import to_2tuple
 from torch.utils.data import Dataset
 from torchvision import transforms
 from monai.transforms.spatial.array import GridPatch
-from utils import get_dicom
+from utils import cached_get_dicom
 from utils import stratified_group_split
 
 logger = logging.getLogger()
@@ -49,13 +50,13 @@ def log_summary(label, df):
     padding = table_width - label_width - 1
     logger.info(
         f"\n{label} {'*' * padding}\n"
-        + " " * 15
+        + " " * 10
         + "malignant"
-        + " " * 25
+        + " " * 20
         + "benign\n"
-        + "_" * 32
+        + "_" * 23
         + "  "
-        + "_" * 32
+        + "_" * 23
         + "\n"
         + table_text
         + "\n"
@@ -65,16 +66,18 @@ def log_summary(label, df):
 class CMMDDataset(Dataset):
     def __init__(
         self,
-        transform,
+        transform=None,
         exclude: pd.core.series.Series = None,
         # image_size: int = (2016, 3808),
         prescale: float = 1.0,
         debug: bool = False,
         data_path: str = "/gpfs/data/huo-lab/Image/CMMD",
         metadata=None,
-        **pad_kwargs,
+        return_label=True,
     ):
         self.data_path = data_path
+        if transform is None:
+            transform = torch.nn.Identity()
         if metadata is None:
             self.metadata = self.preprocess()
         else:
@@ -92,18 +95,8 @@ class CMMDDataset(Dataset):
             metadata = metadata[:16]
         # self.image_size = to_2tuple(image_size)
         self.transform = transform
-        self.load_views()
-
-    def load_views(self):
-        start = time.time()
-        self.views = []
-        for fn in tqdm(self.metadata.path):
-            self.views.append(get_dicom(fn))
-        logger.info(
-            "finished loading {} views in {:.0f}s".format(
-                len(self), time.time() - start
-            )
-        )
+        self.return_label = return_label
+        log_summary("train + validation", self.metadata)
 
     def preprocess(self):
         path = os.path.join(self.data_path, "per_view_metadata.csv")
@@ -144,16 +137,12 @@ class CMMDDataset(Dataset):
             Tuple of images:
         """
         view = self.metadata.iloc[index]
-        # image = self.transform(get_dicom(view.path))
-        image = self.transform(self.views[index])
-
-        # frac_black = result[0][result[0] < 0.0].shape[0] / result[0].view(-1).shape[0]
-        # while frac_black > self.max_frac_black:
-        #     result = self.transform(self.crop(image))
-        #     frac_black = (
-        #         result[0][result[0] < 0.0].shape[0] / result[0].view(-1).shape[0]
-        #     )
-        return image, view.malignant
+        # this is a small dataset; we can cache full copies on all workers
+        image = self.transform(cached_get_dicom(view.path))
+        if self.return_label:
+            return image, view.malignant
+        else:
+            return image
 
 
 def get_datasets(
@@ -184,10 +173,12 @@ def get_datasets(
     fit_indices = np.arange(len(fit_metadata))
     fit_datasets = [
         (
-            CMMDDataset(metadata.iloc[train_indexes], image_transform=train_transform),
             CMMDDataset(
-                metadata.iloc[val_indexes],
-                image_transform=val_transform,
+                metadata=metadata.iloc[train_indexes], transform=train_transform
+            ),
+            CMMDDataset(
+                metadata=metadata.iloc[val_indexes],
+                transform=val_transform,
             ),
         )
         for train_indexes, val_indexes in cv.split(
@@ -196,11 +187,62 @@ def get_datasets(
     ]
 
     test_dataset = CMMDDataset(
-        test_metadata,
-        image_transform=val_transform,
+        metadata=test_metadata,
+        transform=val_transform,
     )
 
     log_summary("train + validation", fit_metadata)
     log_summary("testing", test_metadata)
 
     return fit_datasets, test_dataset
+
+
+@retry(tries=10)
+def get_tile(crop, image, max_frac_black):
+    tile_pil = crop(image)
+    tile_tensor = F.to_tensor(tile_pil)
+    frac_black = (
+        tile_tensor[tile_tensor == tile_tensor.max()].view(-1).shape[0]
+        / tile_tensor.view(-1).shape[0]
+    )
+    if frac_black < max_frac_black:
+        return tile_pil
+    raise RuntimeError("Couldn't find non-background tile after ten attempts")
+
+
+class CMMDRandomTileDataset(CMMDDataset):
+    def __init__(
+        self,
+        transform=None,
+        exclude: pd.core.series.Series = None,
+        prescale: float = 1.0,
+        debug: bool = False,
+        data_path: str = "/gpfs/data/huo-lab/Image/CMMD",
+        metadata=None,
+        tiles_per_view=20,
+    ):
+        super().__init__(
+            transform=transform,
+            exclude=exclude,
+            prescale=prescale,
+            debug=debug,
+            data_path=data_path,
+            metadata=metadata,
+        )
+        self.tiles_per_view = tiles_per_view
+
+    def __len__(self) -> int:
+        return len(self.metadata) * self.tiles_per_view
+
+    def __getitem__(self, index: int) -> Tuple:
+        """Get item.
+
+        Args:
+            idx (int): Index in the metadata table to retrieve.
+
+        Returns:
+            Tuple of images:
+        """
+        view = self.metadata.iloc[index % len(self.metadata)]
+        # this is a small dataset; we can cache full copies on all workers
+        return self.transform(cached_get_dicom(view.path))

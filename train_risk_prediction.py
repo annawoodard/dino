@@ -96,6 +96,7 @@ def extract_features_and_labels(
         x = torch.cat([image_output, contra_output], dim=1)
         x = x.view(x.size(0), -1)
 
+        # TODO check this
         x = nn.functional.normalize(x, dim=1, p=2)
 
         features += [x]
@@ -509,6 +510,8 @@ def train(mlp, optimizer, features, durations, events, epoch, batch_size, criter
 
         outputs += [output]
 
+    # gather the stats from all processes
+    # metric_logger.synchronize_between_processes()
     logger.info("Averaged stats: %s", metric_logger)
 
     # needed for estimating censorship distribution
