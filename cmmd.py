@@ -128,8 +128,7 @@ class CMMDDataset(Dataset):
             data.classification == "Malignant"
         )
         data.malignant = data.malignant.astype(int)
-        data.exam_id
-        data.to_csv(os.path.join(self.data_path, "per_view_metadata.csv"))
+        data.to_csv(os.path.join(self.data_path, "per_view_metadata.csv"), index=False)
         return data
 
     def __len__(self) -> int:
@@ -182,7 +181,7 @@ def get_datasets(
     cv = StratifiedGroupKFold(
         n_splits=n_splits, shuffle=True, random_state=random_state
     )
-    indexes = np.arange(len(metadata))
+    fit_indices = np.arange(len(fit_metadata))
     fit_datasets = [
         (
             CMMDDataset(metadata.iloc[train_indexes], image_transform=train_transform),
@@ -192,7 +191,7 @@ def get_datasets(
             ),
         )
         for train_indexes, val_indexes in cv.split(
-            indexes, fit_metadata.malignant, fit_metadata.ID1
+            fit_indices, fit_metadata.malignant, fit_metadata.ID1
         )
     ]
 
