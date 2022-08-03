@@ -521,6 +521,7 @@ def train_dino(gpu, args):
         num_workers=args.num_workers,
         pin_memory=True,
         drop_last=True,
+        shuffle=True,
     )
 
     # ============ init schedulers ... ============
