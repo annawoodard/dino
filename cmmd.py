@@ -1,29 +1,19 @@
 import os
+import urllib.request
 import torchvision.transforms.functional as F
 import numpy as np
-import glob
-import pydicom
-import itertools
-from tqdm import tqdm
-import torch.distributed as dist
 import logging
-import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 from retry import retry
 import tabulate
 
-# import cv2
 import pandas as pd
 import torch
 from sklearn.model_selection import StratifiedGroupKFold
-from PIL import Image
-from sklearn.model_selection import train_test_split
-from timm.models.layers import to_2tuple
 from torch.utils.data import Dataset
-from torchvision import transforms
-from monai.transforms.spatial.array import GridPatch
-from utils import cached_get_dicom
-from utils import stratified_group_split
+from utils import cached_get_dicom, stratified_group_split
+
+from tcia_download import download_collection
 
 logger = logging.getLogger()
 
@@ -71,7 +61,7 @@ class CMMDDataset(Dataset):
         # image_size: int = (2016, 3808),
         prescale: float = 1.0,
         debug: bool = False,
-        data_path: str = "/gpfs/data/huo-lab/Image/CMMD",
+        data_path: str = "/net/scratch/annawoodard/cmmd",
         metadata=None,
         return_label=True,
     ):
@@ -99,30 +89,36 @@ class CMMDDataset(Dataset):
         log_summary("train + validation", self.metadata)
 
     def preprocess(self):
-        path = os.path.join(self.data_path, "per_view_metadata.csv")
-        if os.path.isfile(path):
-            return pd.read_csv(path)
+        metadata_path = os.path.join(self.data_path, "metadata.csv")
+        if os.path.isfile(metadata_path):
+            return pd.read_csv(metadata_path)
 
-        cmmd = pd.read_excel(
-            os.path.join(self.data_path, "CMMD_clinicaldata_revision.xlsx")
+        urllib.request.urlretrieve(
+            "https://wiki.cancerimagingarchive.net/download/attachments/70230508/CMMD_clinicaldata_revision.xlsx?api=v2",
+            os.path.join(self.data_path, "clinical_data.xlsx"),
         )
-        data = []
-        dicoms = glob.glob(os.path.join(self.data_path, "*/*/*/*dcm"))
-        for path in tqdm(dicoms):
-            f = pydicom.dcmread(path)
-            row = cmmd[cmmd.ID1 == f.PatientID].to_dict("records")[0].copy()
-            row["ImageLaterality"] = f.ImageLaterality
-            row["path"] = path
-            row["view"] = f.ViewCodeSequence[0].CodeMeaning
-            data.append(row)
+        download_collection(
+            "CMMD",
+            "MG",
+            self.data_path,
+            save_tags=[
+                ("ImageLaterality", "ImageLaterality"),
+                (lambda x: x.ViewCodeSequence[0].CodeMeaning, "view"),
+            ],
+        )
+        clinical_data = pd.read_excel(
+            os.path.join(self.data_path, "clinical_data.xlsx")
+        )
+        metadata = pd.read_csv(metadata_path)
+        clinical_data["PatientID"] = clinical_data.ID1
+        metadata = metadata.join(clinical_data.set_index("PatientID"), on="PatientID")
 
-        data = pd.DataFrame(data)
-        data["malignant"] = (data.LeftRight == data.ImageLaterality) & (
-            data.classification == "Malignant"
+        metadata["malignant"] = (metadata.LeftRight == metadata.ImageLaterality) & (
+            metadata.classification == "Malignant"
         )
-        data.malignant = data.malignant.astype(int)
-        data.to_csv(os.path.join(self.data_path, "per_view_metadata.csv"), index=False)
-        return data
+        metadata.malignant = metadata.malignant.astype(int)
+        metadata.to_csv(metadata_path, index=False)
+        return metadata
 
     def __len__(self) -> int:
         return len(self.metadata)
