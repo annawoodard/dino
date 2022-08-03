@@ -19,6 +19,7 @@ import argparse
 import os
 import uuid
 from pathlib import Path
+import torch
 
 import main_dino
 import submitit
@@ -37,7 +38,7 @@ def parse_args():
     parser.add_argument("--timeout", default=2800, type=int, help="Duration of the job")
 
     parser.add_argument(
-        "--partition", default="learnfair", type=str, help="Partition where to submit"
+        "--partition", default="general", type=str, help="Partition where to submit"
     )
     parser.add_argument(
         "--use_volta32", action="store_true", help="Big models? Use this"
@@ -52,9 +53,9 @@ def parse_args():
 
 
 def get_shared_folder() -> Path:
-    user = os.getenv("USER")
-    if Path("/checkpoint/").is_dir():
-        p = Path(f"/checkpoint/{user}/experiments")
+    home = os.getenv("HOME")
+    if Path(home).is_dir():
+        p = Path(f"{home}/experiments")
         p.mkdir(exist_ok=True)
         return p
     raise RuntimeError("No shared folder available")
@@ -77,6 +78,9 @@ class Trainer(object):
         import main_dino
 
         self._setup_gpu_args()
+        if self.args.seed is None:
+            self.args.seed = torch.randint(0, 100000, (1,)).item()
+        Path(self.args.output_dir).mkdir(parents=True, exist_ok=True)
         main_dino.train_dino(self.args)
 
     def checkpoint(self):

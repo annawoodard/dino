@@ -348,9 +348,7 @@ def get_args_parser():
     return parser
 
 
-def train_dino(gpu, args):
-    args.gpu = gpu
-    args.rank = gpu
+def train_dino(args):
     utils.init_distributed_mode(args)
     utils.fix_random_seeds(args.seed)
     cudnn.benchmark = True
@@ -360,6 +358,10 @@ def train_dino(gpu, args):
     logger.info(
         "\n".join("%s: %s" % (k, str(v)) for k, v in sorted(dict(vars(args)).items()))
     )
+    if utils.is_main_process():
+        with (Path(args.output_dir) / "args.json").open("a") as f:
+            f.write(json.dumps(sorted(dict(vars(args)).items())) + "\n")
+        utils.log_code_state(args.output_dir)
 
     # ============ building student and teacher networks ... ============
     # we changed the name DeiT-S for ViT-S to avoid confusions
@@ -855,15 +857,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
     if args.seed is None:
         args.seed = torch.randint(0, 100000, (1,)).item()
-    if args.devices is None:
-        args.devices = [f"{i}" for i in range(torch.cuda.device_count())]
-    if args.world_size is None:
-        args.world_size = len(args.devices)
-    args.port = str(utils.get_unused_local_port())
+    # args.port = str(utils.get_unused_local_port())
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
-    utils.log_code_state(args.output_dir)
-    mp.spawn(
-        train_dino,
-        nprocs=len(args.devices),
-        args=(args,),
-    )
+    train_dino(args)
