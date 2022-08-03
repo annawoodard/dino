@@ -44,8 +44,9 @@ from chimec import (
     ChiMECSSLDataset,
     ChiMECStackedSSLDataset,
     ChiMECRandomTileSSLDataset,
+    CHIMEC_MEAN,
+    CHIMEC_STD,
 )
-from maicara.data.constants import CHIMEC_MEAN, CHIMEC_STD
 
 torchvision_archs = sorted(
     name
