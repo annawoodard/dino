@@ -234,6 +234,12 @@ def get_args_parser():
         help="""Dataset to use.""",
     )
     parser.add_argument(
+        "--note",
+        default="",
+        type=str,
+        help="""Note to record""",
+    )
+    parser.add_argument(
         "--drop_path_rate", type=float, default=0.1, help="stochastic depth rate"
     )
 
