@@ -665,6 +665,11 @@ def init_distributed_mode(args):
         args.gpu = int(os.environ["LOCAL_RANK"])
     # launched with submitit on a slurm cluster
     elif "SLURM_PROCID" in os.environ:
+        # os.environ["NCCL_DEBUG"] = "INFO"
+        os.environ["MASTER_ADDR"] = os.environ["SLURM_SUBMIT_HOST"]
+        os.environ["MASTER_PORT"] = "29500"
+        os.environ["NCCL_IB_DISABLE"] = "1"
+
         args.rank = int(os.environ["SLURM_PROCID"])
         args.gpu = args.rank % torch.cuda.device_count()
     # launched naively with `python main_dino.py`
