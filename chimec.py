@@ -3,7 +3,6 @@ import itertools
 from tqdm import tqdm
 from functools import lru_cache
 import torch.distributed as dist
-import retry
 import logging
 import time
 from typing import Callable, Dict, Optional, Tuple, Union
@@ -24,6 +23,9 @@ from torchvision import transforms
 from utils import stratified_group_split
 
 logger = logging.getLogger()
+
+CHIMEC_MEAN = 0.21024
+CHIMEC_STD = 0.19605
 
 
 @retry(tries=3, delay=1, backoff=2)
@@ -90,7 +92,7 @@ def log_summary(label, df):
 class ChiMECRandomTileSSLDataset(Dataset):
     def __init__(
         self,
-        transform,
+        transform=None,
         exclude: pd.core.series.Series = None,
         image_size: int = (2016, 3808),
         tile_size: int = 224,
@@ -100,6 +102,8 @@ class ChiMECRandomTileSSLDataset(Dataset):
         debug: bool = False,
         views_per_epoch: int = 500,
     ):
+        if transform is None:
+            transform = torch.nn.Identity()
         metadata = pd.read_pickle(
             "/gpfs/data/huo-lab/Image/annawoodard/maicara/data/interim/mammo_loose_cuts_v3/series_metadata.pkl"
         )
@@ -186,11 +190,13 @@ class ChiMECRandomTileSSLDataset(Dataset):
 class ChiMECSSLDataset(Dataset):
     def __init__(
         self,
-        transform,
+        transform=None,
         exclude: pd.core.series.Series = None,
         image_size: int = 224,
         prescale: float = 1.0,
     ):
+        if transform is None:
+            transform = torch.nn.Identity()
         metadata = pd.read_pickle(
             "/gpfs/data/huo-lab/Image/annawoodard/maicara/data/interim/mammo_loose_cuts_v3/series_metadata.pkl"
         )
@@ -241,11 +247,13 @@ class ChiMECSSLDataset(Dataset):
 class ChiMECStackedSSLDataset(Dataset):
     def __init__(
         self,
-        transform,
+        transform=None,
         exclude: pd.core.series.Series = None,
         image_size: int = 224,
         prescale: float = 1.0,
     ):
+        if transform is None:
+            transform = torch.nn.Identity()
         metadata = pd.read_pickle(
             "/gpfs/data/huo-lab/Image/annawoodard/maicara/data/interim/mammo_loose_cuts_v3/series_metadata.pkl"
         )
