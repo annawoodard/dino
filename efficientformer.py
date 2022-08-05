@@ -619,6 +619,21 @@ def efficientformer_l3(pretrained=False, **kwargs):
 
 
 @register_model
+def efficientformer_l3_narrow(pretrained=False, **kwargs):
+    embed_dims = EfficientFormer_width["l3"]
+    embed_dims[-1] = 256
+    model = EfficientFormer(
+        layers=EfficientFormer_depth["l3"],
+        embed_dims=embed_dims,
+        downsamples=[True, True, True, True],
+        vit_num=4,
+        **kwargs,
+    )
+    model.default_cfg = _cfg(crop_pct=0.9)
+    return model
+
+
+@register_model
 def efficientformer_l7(pretrained=False, **kwargs):
     model = EfficientFormer(
         layers=EfficientFormer_depth["l7"],
