@@ -33,9 +33,21 @@ def parse_args():
         "--ngpus", default=8, type=int, help="Number of gpus to request on each node"
     )
     parser.add_argument(
+        "--mem_gb_per_gpu",
+        default=40,
+        type=int,
+        help="CPU memory in GB to request per GPU",
+    )
+    parser.add_argument(
+        "--gpuspec",
+        default=None,
+        type=str,
+        help="Request specific GPU type e.g. 'a40'",
+    )
+    parser.add_argument(
         "--nodes", default=2, type=int, help="Number of nodes to request"
     )
-    parser.add_argument("--timeout", default=2800, type=int, help="Duration of the job")
+    parser.add_argument("--timeout", default=240, type=int, help="Duration of the job")
 
     parser.add_argument(
         "--partition", default="general", type=str, help="Partition where to submit"
@@ -111,7 +123,9 @@ def main():
     if args.output_dir == "":
         args.output_dir = get_shared_folder() / "%j"
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
-    executor = submitit.AutoExecutor(folder=args.output_dir, slurm_max_num_timeout=30)
+    executor = submitit.AutoExecutor(
+        folder=os.path.join(args.output_dir, "submitit"), slurm_max_num_timeout=30
+    )
 
     num_gpus_per_node = args.ngpus
     nodes = args.nodes
@@ -123,10 +137,14 @@ def main():
         kwargs["slurm_constraint"] = "volta32gb"
     if args.comment:
         kwargs["slurm_comment"] = args.comment
+    if args.gpuspec:
+        kwargs["slurm_gres"] = f"gpu:{args.gpuspec}:{args.ngpus}"
+    else:
+        kwargs["gpus_per_node"] = args.ngpus
 
     executor.update_parameters(
-        mem_gb=40 * num_gpus_per_node,
-        gpus_per_node=num_gpus_per_node,
+        mem_gb=args.mem_gb_per_gpu * num_gpus_per_node,
+        # gpus_per_node=num_gpus_per_node,
         tasks_per_node=num_gpus_per_node,  # one task per GPU
         cpus_per_task=10,
         nodes=nodes,
