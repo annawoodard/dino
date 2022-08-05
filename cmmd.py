@@ -150,7 +150,7 @@ def get_datasets(
     n_splits,
     random_state,
     test_size=0.15,
-    metadata_path="/gpfs/data/huo-lab/Image/CMMD/per_view_metadata.csv",
+    metadata_path="",
 ):
     metadata = pd.read_csv(metadata_path)
     if prescale:
@@ -195,17 +195,19 @@ def get_datasets(
     return fit_datasets, test_dataset
 
 
-@retry(tries=10)
-def get_tile(crop, image, max_frac_black):
-    tile_pil = crop(image)
-    tile_tensor = F.to_tensor(tile_pil)
-    frac_black = (
-        tile_tensor[tile_tensor == tile_tensor.max()].view(-1).shape[0]
-        / tile_tensor.view(-1).shape[0]
-    )
-    if frac_black < max_frac_black:
-        return tile_pil
-    raise RuntimeError("Couldn't find non-background tile after ten attempts")
+def background_crop(image):
+    # count number of white pixels in columns as new 1D array
+    count_cols = torch.count_nonzero(image, dim=1)
+
+    # get first and last x coordinate where black
+    first_x = torch.argwhere(count_cols.squeeze() > 0)[0].item()
+    last_x = torch.argwhere(count_cols.squeeze() > 0)[-1].item()
+
+    return image[
+        :,
+        :,
+        first_x : last_x + 1,
+    ]
 
 
 class CMMDRandomTileDataset(CMMDDataset):
@@ -215,9 +217,11 @@ class CMMDRandomTileDataset(CMMDDataset):
         exclude: pd.core.series.Series = None,
         prescale: float = 1.0,
         debug: bool = False,
-        data_path: str = "/gpfs/data/huo-lab/Image/CMMD",
+        data_path: str = "/net/scratch/annawoodard/cmmd",
         metadata=None,
         tiles_per_view=20,
+        tile_size=224,
+        max_frac_black=0.96,
     ):
         super().__init__(
             transform=transform,
@@ -228,6 +232,21 @@ class CMMDRandomTileDataset(CMMDDataset):
             metadata=metadata,
         )
         self.tiles_per_view = tiles_per_view
+        self.max_frac_black = max_frac_black
+        self.crop = transforms.RandomCrop(tile_size)
+
+    @retry(tries=10)
+    def get_tile(self, image):
+        # tile_pil = self.crop(image)
+        bg_cropped_tile = background_crop(F.to_tensor(image))
+
+        frac_black = (
+            bg_cropped_tile[bg_cropped_tile == bg_cropped_tile.max()].view(-1).shape[0]
+            / bg_cropped_tile.contiguous().view(-1).shape[0]
+        )
+        if frac_black < self.max_frac_black:
+            return F.to_pil_image(bg_cropped_tile)
+        raise RuntimeError("Couldn't find non-background tile after ten attempts")
 
     def __len__(self) -> int:
         return len(self.metadata) * self.tiles_per_view
@@ -243,4 +262,6 @@ class CMMDRandomTileDataset(CMMDDataset):
         """
         view = self.metadata.iloc[index % len(self.metadata)]
         # this is a small dataset; we can cache full copies on all workers
-        return self.transform(cached_get_dicom(view.path))
+        tile = self.get_tile(cached_get_dicom(view.path))
+        return self.transform(tile)
+        # return self.transform(cached_get_dicom(view.path))
