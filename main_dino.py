@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import argparse
+import pickle
 import torch.multiprocessing as mp
 import os
 import sys
@@ -73,6 +74,9 @@ def get_args_parser():
             "deit_tiny",
             "deit_small",
             "efficientformer_l3",
+            "efficientformer_l3_narrow",
+            "efficientformer_l1",
+            "efficientformer_l7",
         ]
         + torchvision_archs,
         # + torch.hub.list("facebookresearch/xcit:main"),
@@ -354,13 +358,15 @@ def train_dino(args):
     cudnn.benchmark = True
 
     logger = utils.setup_logging(args.output_dir, "pretrain", args.rank)
+    logger.info(f"starting training on {os.environ['HOSTNAME']}")
     logger.info("git:\n  {}\n".format(utils.get_sha()))
     logger.info(
         "\n".join("%s: %s" % (k, str(v)) for k, v in sorted(dict(vars(args)).items()))
     )
+    logger.info(f"called with: python {' '.join(sys.argv)}")
     if utils.is_main_process():
-        with (Path(args.output_dir) / "args.json").open("a") as f:
-            f.write(json.dumps(sorted(dict(vars(args)).items())) + "\n")
+        with (Path(args.output_dir) / "args.pkl").open("wb") as f:
+            pickle.dump(args, f)
         utils.log_code_state(args.output_dir)
 
     # ============ building student and teacher networks ... ============
@@ -517,10 +523,7 @@ def train_dino(args):
                 debug=args.debug,
             )
     elif args.dataset == "cmmd":
-        transform = transforms.Compose(
-            [transforms.RandomCrop(args.tile_size), transform]
-        )
-        dataset = CMMDRandomTileDataset(transform=transform)
+        dataset = CMMDRandomTileDataset(transform=transform, tile_size=args.tile_size)
     utils.write_example_dino_augs(dataset, args.output_dir)
     sampler = torch.utils.data.DistributedSampler(dataset, shuffle=True)
     data_loader = torch.utils.data.DataLoader(
@@ -530,7 +533,6 @@ def train_dino(args):
         num_workers=args.num_workers,
         pin_memory=True,
         drop_last=True,
-        shuffle=True,
     )
 
     # ============ init schedulers ... ============

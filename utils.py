@@ -31,6 +31,8 @@ import time
 from collections import defaultdict, deque
 from pathlib import Path
 from typing import Callable, Dict, Optional, Tuple, Union
+from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 import git
 import matplotlib.pyplot as plt
@@ -46,6 +48,33 @@ from torchvision.utils import make_grid
 from functools import lru_cache
 
 logger = logging.getLogger()
+
+
+def calculate_dataset_stats(dataset, num_workers=0):
+    print("calculating dataset mean and standard deviation...")
+
+    loader = DataLoader(
+        dataset,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+    )
+    means = []
+    stds = []
+    for i, (image, _) in enumerate(tqdm(loader)):
+        image = image * 1.0  # pytorch will not compute mean/std of integers
+        means.append(torch.mean(image))
+        stds.append(torch.std(image))
+        if i % 10000 == 0:
+            means = [torch.mean(torch.tensor(means))]
+            stds = [torch.mean(torch.tensor(stds))]
+
+    mean = torch.mean(torch.tensor(means))
+    std = torch.mean(torch.tensor(stds))
+
+    print(f"dataset mean: {mean}\ndataset std: {std}")
+
+    return mean, std
 
 
 def get_dicom(path):

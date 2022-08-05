@@ -13,7 +13,7 @@ import pandas as pd
 import torch
 from sklearn.model_selection import StratifiedGroupKFold
 from torch.utils.data import Dataset
-from utils import cached_get_dicom, stratified_group_split
+from utils import cached_get_dicom, stratified_group_split, calculate_dataset_stats
 
 from tcia_download import download_collection
 
