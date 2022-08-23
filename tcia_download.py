@@ -88,39 +88,40 @@ def download_collection(collection_name, modality, download_path, save_tags=None
 
 
 def dicom_series_to_nifti(series, dicom_root, nifti_root):
-    if "VOLSER" in series["SeriesDescription"]:
-        dicom_series = os.path.join(
-            dicom_root,
-            series["PatientID"],
-            series["StudyInstanceUID"],
-            series["SeriesInstanceUID"],
-        )
-        os.makedirs(
-            os.path.join(nifti_root, series["PatientID"], series["StudyInstanceUID"]),
-            exist_ok=True,
-        )
-        nifti_partial_path = os.path.join(
-            nifti_root,
-            series["PatientID"],
-            series["StudyInstanceUID"],
-            series["SeriesInstanceUID"] + ".partial.nii.gz",
-        )
-        nifti_final_path = nifti_partial_path.replace("partial.nii.gz", "nii.gz")
-        if os.path.isfile(nifti_partial_path):
-            os.unlink(nifti_partial_path)
-        if not os.path.isfile(nifti_final_path):
-            try:
+    try:
+        if "VOLSER" in series["SeriesDescription"]:
+            dicom_series = os.path.join(
+                dicom_root,
+                series["PatientID"],
+                series["StudyInstanceUID"],
+                series["SeriesInstanceUID"],
+            )
+            os.makedirs(
+                os.path.join(
+                    nifti_root, series["PatientID"], series["StudyInstanceUID"]
+                ),
+                exist_ok=True,
+            )
+            nifti_partial_path = os.path.join(
+                nifti_root,
+                series["PatientID"],
+                series["StudyInstanceUID"],
+                series["SeriesInstanceUID"] + ".partial.nii.gz",
+            )
+            nifti_final_path = nifti_partial_path.replace("partial.nii.gz", "nii.gz")
+            if os.path.isfile(nifti_partial_path):
+                os.unlink(nifti_partial_path)
+            if not os.path.isfile(nifti_final_path):
                 dicom2nifti.dicom_series_to_nifti(
                     dicom_series,
                     nifti_partial_path,
                     reorient_nifti=True,
                 )
                 os.rename(nifti_partial_path, nifti_final_path)
-            except Exception as e:
-                print(f"problem converting series {series}: {e}")
-                series["error"] = e
-                return series
-        series["nifti_path"] = nifti_final_path
+            series["nifti_path"] = nifti_final_path
+    except Exception as e:
+        print(f"problem converting series {series}: {e}")
+        series["error"] = e
 
     return series
 
@@ -129,6 +130,8 @@ def dicom_collection_to_nifti(dicom_path, nifti_path):
     os.makedirs(nifti_path, exist_ok=True)
     series = pd.read_csv(os.path.join(dicom_path, "per_series_metadata.csv"))
     series.PatientID = series.PatientID.astype(str)
+    series.StudyInstanceUID = series.StudyInstanceUID.astype(str)
+    series.SeriesInstanceUID = series.SeriesInstanceUID.astype(str)
     rows = p_umap(
         dicom_series_to_nifti,
         series.to_dict("records"),
@@ -137,6 +140,11 @@ def dicom_collection_to_nifti(dicom_path, nifti_path):
         num_cpus=args.cpus,
     )
     series_metadata = pd.DataFrame(rows)
+
+    series_metadata = pd.read_csv(os.path.join(nifti_path, "per_series_metadata.csv"))
+    series_metadata["nifti_exists"] = series_metadata.nifti_path.apply(
+        lambda x: os.path.isfile(str(x))
+    )
     series_metadata.to_csv(
         os.path.join(nifti_path, "per_series_metadata.csv"), index=False
     )
@@ -153,18 +161,18 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    start = time.time()
-    download_collection(
-        args.collection,
-        args.modality,
-        args.dicom_path,
-        save_tags=[x.split(",") for x in args.save_tags]
-        if args.save_tags is not None
-        else None,
-    )
-    print(
-        f"Done downloading {args.collection} in {((time.time() - start) / 60.):.0f} minutes."
-    )
+    # start = time.time()
+    # download_collection(
+    #     args.collection,
+    #     args.modality,
+    #     args.dicom_path,
+    #     save_tags=[x.split(",") for x in args.save_tags]
+    #     if args.save_tags is not None
+    #     else None,
+    # )
+    # print(
+    #     f"Done downloading {args.collection} in {((time.time() - start) / 60.):.0f} minutes."
+    # )
     if args.nifti_path is not None:
         start = time.time()
         dicom_collection_to_nifti(args.dicom_path, args.nifti_path)
