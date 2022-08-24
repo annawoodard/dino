@@ -12,7 +12,7 @@ import tabulate
 import pandas as pd
 import torch
 from sklearn.model_selection import StratifiedGroupKFold
-from torch.utils.data import Dataset
+from monai.data import Dataset
 from utils import cached_get_dicom, stratified_group_split
 
 from tcia_download import download_collection, dicom_collection_to_nifti
@@ -68,7 +68,7 @@ def log_summary(label, df):
     )
 
 
-class ISPY2Dataset(CacheDataset):
+class ISPY2Dataset(Dataset):
     def __init__(
         self,
         transform=None,
@@ -81,9 +81,9 @@ class ISPY2Dataset(CacheDataset):
         include_series=None,
         require_series=None,
         timepoints=None,
-        cache_num=24,
-        cache_rate=1.0,
-        num_workers=4,
+        # cache_num=24,
+        # cache_rate=1.0,
+        # num_workers=4,
     ):
         self.data_path = data_path
         if transform is None:
@@ -95,10 +95,10 @@ class ISPY2Dataset(CacheDataset):
         self.metadata = self.metadata[self.metadata.nifti_exists == True]
 
         if exclude is not None:
-            original = self.metadata.path.nunique()
+            original = self.metadata.nifti_path.nunique()
             self.metadata = self.metadata[~self.metadata["PatientID"].isin(exclude)]
             print(
-                f"dropped {original - metadata.path.nunique()} views from patients in the finetuning testing set"
+                f"dropped {original - metadata.nifti_path.nunique()} views from patients in the finetuning testing set"
             )
         if prescale:
             self.metadata = self.metadata.sample(frac=prescale)
@@ -152,9 +152,6 @@ class ISPY2Dataset(CacheDataset):
         super(ISPY2Dataset, self).__init__(
             data=studies,
             transform=transform,
-            cache_num=cache_num,
-            cache_rate=cache_rate,
-            num_workers=num_workers,
         )
 
     def preprocess(self):
