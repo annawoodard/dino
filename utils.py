@@ -77,6 +77,18 @@ def calculate_dataset_stats(dataset, num_workers=0):
     return mean, std
 
 
+def get_tags(dicom, save_tags):
+    row = {}
+    if save_tags is not None:
+        f = pydicom.dcmread(dicom)
+        for tag, label in save_tags:
+            if callable(tag):
+                row[label] = tag(f)
+            else:
+                row[label] = getattr(f, tag)
+    return row
+
+
 def get_dicom(path):
     f = pydicom.dcmread(path)
     return Image.fromarray(f.pixel_array).convert("L")
