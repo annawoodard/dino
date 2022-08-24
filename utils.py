@@ -46,6 +46,7 @@ from sklearn.model_selection import train_test_split
 from torch import nn
 from torchvision.utils import make_grid
 from functools import lru_cache
+from matplotlib.gridspec import SubplotSpec
 
 logger = logging.getLogger()
 
@@ -119,14 +120,32 @@ def stratified_group_split(
     return samples_train, samples_test
 
 
+def make_mip(image):
+    shape = image.shape
+    mip = torch.zeros(image.shape[1:3])
+    for i in range(shape[1]):
+        for j in range(shape[2]):
+            mip[i, j] = torch.max(image[:, i, j, :])
+    return mip
+
+
 def write_example_dino_augs(
-    dataset, output_directory, num_examples=10, local_crops_number=8
+    dataset,
+    output_directory,
+    num_examples=5,
+    local_crops_number=8,
+    three_dim=False,
+    series=None,
 ):
     patch_lists = []
     for i, entry in enumerate(dataset):
         patch_lists.append(entry)
-        if i == num_examples:
+        if i == num_examples - 1:
             break
+    if three_dim:
+        print("making mips...")
+        for i, _ in tqdm(enumerate(patch_lists)):
+            patch_lists[i] = [make_mip(p[series]) for p in patch_lists[i]]
     rc = {
         "axes.spines.left": False,
         "axes.spines.right": False,
@@ -142,29 +161,33 @@ def write_example_dino_augs(
         "savefig.facecolor": "white",
     }
     plt.rcParams.update(rc)
-    f, axes = plt.subplots(num_examples + 1, 2, figsize=(20, 40))
-    axes[0][0].set_title("global views")
-    axes[0][1].set_title("local views", pad=65)
-    for i, patches in enumerate(patch_lists):
-        global_views = make_grid(patches[:2], nrow=2)[
-            0,
-            :,
-        ]
-        local_views = make_grid(patches[2:], nrow=local_crops_number)[
-            0,
-            :,
-        ]
-        axes[i][0].imshow(
-            global_views,
-            cmap="gray",
-        )
-        axes[i][1].imshow(
-            local_views,
-            cmap="gray",
-        )
-        plt.tight_layout()
-        plt.savefig(os.path.join(output_directory, "augmentation_examples.png"))
-        plt.savefig(os.path.join(output_directory, "augmentation_examples.pdf"))
+
+    def create_subtitle(fig: plt.Figure, grid: SubplotSpec, title: str):
+        row = fig.add_subplot(grid)
+        row.set_title(f"{title}\n", fontweight="semibold")
+        row.set_frame_on(False)
+        row.axis("off")
+
+    fig, axes = plt.subplots(
+        num_examples, len(patch_lists[0]) + 1, figsize=(20, 2 * num_examples)
+    )
+    for i, patches in tqdm(enumerate(patch_lists)):
+        for j, p in enumerate(patches[:2]):
+            axes[i][j].imshow(
+                p,
+                cmap="gray",
+            )
+        for j, p in enumerate(patches[2:]):
+            axes[i][j + 3].imshow(
+                p,
+                cmap="gray",
+            )
+    grid = plt.GridSpec(num_examples, len(patch_lists[0]) + 1)
+    create_subtitle(fig, grid[0, 0:1], "global views")
+    create_subtitle(fig, grid[0, 3:10], "local views")
+    fig.tight_layout()
+    plt.savefig(os.path.join(output_directory, "augmentation_examples.png"))
+    plt.savefig(os.path.join(output_directory, "augmentation_examples.pdf"))
 
 
 def save(obj, path):
