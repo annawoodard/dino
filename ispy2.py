@@ -103,7 +103,7 @@ class ISPY2Dataset(Dataset):
         if prescale:
             self.metadata = self.metadata.sample(frac=prescale)
         if debug:
-            metadata = metadata[:16]
+            self.metadata = self.metadata[:16]
         if include_series is not None:
             self.metadata = self.metadata[~pd.isnull(self.metadata.SeriesDescription)]
             self.metadata = self.metadata[
@@ -143,9 +143,12 @@ class ISPY2Dataset(Dataset):
                 "StudyInstanceUID": series.iloc[0].StudyInstanceUID,
                 "ClinicalTrialTimePointID": series.iloc[0].ClinicalTrialTimePointID,
                 "pcR": series.iloc[0].pCR,
+                "image": series.nifti_path.to_list(),
+                "SeriesDescription": series.SeriesDescription.to_list(),
+                "series": [
+                    inverted_series_map[d] for d in series.SeriesDescription.to_list()
+                ],
             }
-            for description, path in zip(series.SeriesDescription, series.nifti_path):
-                data[inverted_series_map[description]] = path
             studies.append(data)
 
         log_summary("train + validation", self.metadata)

@@ -42,6 +42,7 @@ from vision_transformer import DINOHead
 import efficientformer
 import monai.transforms
 from ispy2 import ISPY2Dataset, load_metadata
+from shufflenetv2 import ShuffleNetV2
 
 torchvision_archs = sorted(
     name
@@ -58,22 +59,9 @@ def get_args_parser():
     # Model parameters
     parser.add_argument(
         "--arch",
-        default="vit_small",
+        default="resnet50",
         type=str,
-        choices=[
-            "vit_tiny",
-            "vit_small",
-            "vit_base",
-            "xcit",
-            "deit_tiny",
-            "deit_small",
-            "efficientformer_l3",
-            "efficientformer_l3_narrow",
-            "efficientformer_l1",
-            "efficientformer_l7",
-        ]
-        + torchvision_archs,
-        # + torch.hub.list("facebookresearch/xcit:main"),
+        # choices=["densenet"],
         help="""Name of architecture to train. For quick experiments with ViTs,
         we recommend using vit_tiny or vit_small.""",
     )
@@ -240,7 +228,14 @@ def get_args_parser():
         nargs="+",
         # default=("unilateral_dce", "bilateral_dce"),
         default=["unilateral_dce"],
-        help="""Series to include for training.""",
+        help="""Select INCLUDE_SERIES series""",
+    )
+    parser.add_argument(
+        "--require_series",
+        type=str,
+        nargs="+",
+        default=["unilateral_dce"],
+        help="""Exclude studies which do not contain REQUIRE_SERIES series.""",
     )
     # Multi-crop parameters
     parser.add_argument(
@@ -257,14 +252,13 @@ def get_args_parser():
         "--global_crops_scale",
         type=float,
         nargs="+",
-        default=(1.0, 1.5),
+        default=(0.9, 1.2),
     )
     parser.add_argument(
         "--local_crops_scale",
         type=float,
         nargs="+",
-        # default=(0.05, 0.4),
-        default=(1.5, 2.0),
+        default=(1.2, 1.4),
         help="""Scale range of the cropped image before resizing, relatively to the origin image.
         Used for small local view cropping of multi-crop.""",
     )
@@ -295,7 +289,7 @@ def get_args_parser():
     )
     parser.add_argument(
         "--test_size",
-        default=0.15,
+        default=0.0,
         type=float,
         help="Proportion of finetuning dataset to hold out for testing; these patients will be excluded from pretraining dataset to avoid data leakage",
     )
@@ -352,7 +346,6 @@ def train_dino(args):
     cudnn.benchmark = True
 
     logger = utils.setup_logging(args.output_dir, "pretrain", args.rank)
-    logger.info(f"starting training on {os.environ['HOSTNAME']}")
     logger.info("git:\n  {}\n".format(utils.get_sha()))
     logger.info(
         "\n".join("%s: %s" % (k, str(v)) for k, v in sorted(dict(vars(args)).items()))
@@ -365,15 +358,47 @@ def train_dino(args):
 
     # ============ building student and teacher networks ... ============
     in_chans = 2 if args.stack_views else 1
+    # TODO unhardcode, cleanup arch options
     if args.arch == "densenet":
-        # TODO unhardcode
         embed_dim = 256
         student = monai.networks.nets.DenseNet121(
-            spatial_dim=3, in_channels=in_chans, out_chan=embed_dim
+            spatial_dims=3, in_channels=in_chans, out_channels=embed_dim
         )
         teacher = monai.networks.nets.DenseNet121(
-            spatial_dim=3, in_channels=in_chans, out_chan=embed_dim
+            spatial_dims=3, in_channels=in_chans, out_channels=embed_dim
         )
+    elif args.arch == "vit_narrow_p8":
+        embed_dim = 192
+        student = monai.networks.nets.ViT(
+            1,
+            (args.global_crops_size, args.global_crops_size, args.global_crops_size),
+            8,
+            hidden_size=embed_dim,
+            mlp_dim=3072,
+            num_layers=12,
+            num_heads=6,
+        )
+        teacher = monai.networks.nets.ViT(
+            1,
+            (args.global_crops_size, args.global_crops_size, args.global_crops_size),
+            8,
+            hidden_size=embed_dim,
+            mlp_dim=3072,
+            num_layers=12,
+            num_heads=6,
+        )
+    elif args.arch == "resnet50":
+        student = monai.networks.nets.resnet.resnet50(
+            spatial_dims=3, n_input_channels=1, num_classes=192
+        )
+        teacher = monai.networks.nets.resnet.resnet50(
+            spatial_dims=3, n_input_channels=1, num_classes=192
+        )
+        embed_dim = student.fc.weight.shape[1]
+    elif args.arch == "shufflenetv2":
+        embed_dim = 192
+        student = ShuffleNetV2(num_classes=embed_dim)
+        teacher = ShuffleNetV2(num_classes=embed_dim)
     else:
         logger.error(f"Unknow architecture: {args.arch}")
     logger.info(
@@ -467,40 +492,40 @@ def train_dino(args):
     # exclude any patients in testing set from pretraining set
     # fit = val + train sets
     if fit_metadata is None:
-        fit_metadata, test_metadata = load_metadata(args.test_size)
+        fit_metadata, test_metadata = load_metadata(
+            args.test_size, prescale=args.prescale
+        )
 
     image_level_transform = monai.transforms.Compose(
         [
-            monai.transforms.LoadImaged(keys=args.include_series),
-            monai.transforms.EnsureChannelFirstd(keys=args.include_series),
+            monai.transforms.LoadImaged(keys="image"),
+            monai.transforms.EnsureChannelFirstd(keys="image"),
+            utils.TimeMIP(keys="image"),  # TODO take last volume
             monai.transforms.ScaleIntensityd(
-                keys=args.include_series,
+                keys="image",
             ),
         ]
     )
     dataset = ISPY2Dataset(
         transform=image_level_transform,
-        exclude=test_metadata.study_id,
-        prescale=args.prescale,
+        exclude=test_metadata.PatientID,
+        # prescale=args.prescale,
         debug=args.debug,
         metadata=fit_metadata,
         include_series=args.include_series,
-        # require_series=None,
+        require_series=args.require_series,
         # timepoints=None,
-        # cache_num=24,
-        # cache_rate=1.0,
-        # num_workers=4,
     )
     # tile-level transforms
     transform = DataAugmentationDINO(
-        args.include_series,
         args.global_crops_scale,
         args.global_crops_size,
         args.local_crops_scale,
         args.local_crops_number,
         args.local_crops_size,
     )
-    crop_sampler = monai.transforms.RandSpatialCropSamples(
+    crop_sampler = monai.transforms.RandSpatialCropSamplesd(
+        keys="image",
         roi_size=(
             args.global_crops_size,
             args.global_crops_size,
@@ -511,22 +536,29 @@ def train_dino(args):
         random_size=False,
     )
     patch_dataset = monai.data.PatchDataset(
-        dataset=dataset,
+        data=dataset,
         patch_func=crop_sampler,
         samples_per_image=args.tiles_per_image,
         transform=transform,
     )
-    shuffle_dataset = monai.data.ShuffleBuffer(patch_dataset, buffer_size=200, seed=0)
-    sampler = torch.utils.data.DistributedSampler(shuffle_dataset, shuffle=True)
+    shuffle_dataset = utils.DistributedShuffleBuffer(
+        patch_dataset, buffer_size=args.batch_size_per_gpu, seed=0
+    )
+    # data_loader = monai.data.DataLoader(
     data_loader = torch.utils.data.DataLoader(
         shuffle_dataset,
-        sampler=sampler,
+        # sampler=sampler,
         batch_size=args.batch_size_per_gpu,
         num_workers=args.num_workers,
         pin_memory=True,
         drop_last=True,
     )
-    utils.write_example_dino_augs(dataset, args.output_dir)
+    # utils.write_example_dino_augs(
+    #     patch_dataset,
+    #     args.output_dir,
+    #     num_examples=10,
+    #     three_dim=True,
+    # )
 
     # ============ init schedulers ... ============
     lr_schedule = utils.cosine_scheduler(
@@ -535,18 +567,18 @@ def train_dino(args):
         / 256.0,  # linear scaling rule
         args.min_lr,
         args.epochs,
-        len(data_loader),
+        len(patch_dataset),
         warmup_epochs=args.warmup_epochs,
     )
     wd_schedule = utils.cosine_scheduler(
         args.weight_decay,
         args.weight_decay_end,
         args.epochs,
-        len(data_loader),
+        len(patch_dataset),
     )
     # momentum parameter is increased to 1. during training with a cosine schedule
     momentum_schedule = utils.cosine_scheduler(
-        args.momentum_teacher, 1, args.epochs, len(data_loader)
+        args.momentum_teacher, 1, args.epochs, len(patch_dataset)
     )
     logger.info(f"Loss, optimizer and schedulers ready.")
 
@@ -558,7 +590,7 @@ def train_dino(args):
     start_time = time.time()
     logger.info("Starting DINO training!")
     for epoch in range(start_epoch, args.epochs):
-        data_loader.sampler.set_epoch(epoch)
+        # data_loader.sampler.set_epoch(epoch)
 
         # ============ training one epoch of DINO ... ============
         train_stats, last_teacher_output, last_student_output = train_one_epoch(
@@ -638,9 +670,12 @@ def train_one_epoch(
 ):
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = "Epoch: [{}/{}]".format(epoch, args.epochs)
+    data_loader.dataset.shuffle_and_split_source_across_gpus()
+
+    logger.info("finished shuffling and splitting across GPUs")
     for it, images in enumerate(metric_logger.log_every(data_loader, 10, header)):
         # update weight decay and learning rate according to their schedule
-        it = len(data_loader) * epoch + it  # global training iteration
+        it = len(data_loader.dataset.data) * epoch + it  # global training iteration
         for i, param_group in enumerate(optimizer.param_groups):
             param_group["lr"] = lr_schedule[it]
             if i == 0:  # only the first group is regularized
@@ -774,83 +809,95 @@ class DINOLoss(nn.Module):
 class DataAugmentationDINO(object):
     def __init__(
         self,
-        include_series,
         global_crops_scale,
         global_crops_size,
         local_crops_scale,
         local_crops_number,
         local_crops_size,
     ):
+        noise_transform = monai.transforms.OneOf(
+            transforms=[
+                monai.transforms.RandGaussianNoised(keys="image", prob=1.0),
+                monai.transforms.RandBiasFieldd(
+                    keys="image",
+                    prob=0.5,
+                    coeff_range=(0.0, 0.01),
+                ),
+                monai.transforms.RandKSpaceSpikeNoised(
+                    keys="image",
+                    intensity_range=(7, 10),
+                    prob=0.5,
+                ),
+            ]
+        )
+        smoothing_transform = monai.transforms.OneOf(
+            transforms=[
+                monai.transforms.SavitzkyGolaySmoothd(
+                    keys="image", window_length=3, order=1
+                ),
+                monai.transforms.RandGaussianSmoothd(keys="image", prob=0.5),
+            ],
+        )
+        spatial_transform = monai.transforms.OneOf(
+            transforms=[
+                monai.transforms.Rand3DElasticd(
+                    keys="image",
+                    sigma_range=(5, 7),
+                    magnitude_range=(50, 150),
+                    prob=1.0,
+                ),
+                monai.transforms.RandAffineD(
+                    keys="image",
+                    shear_range=(0.0, 0.2),
+                    rotate_range=(0, 45, 0),
+                    prob=0.5,
+                ),
+            ]
+        )
         patch_level_transform = monai.transforms.Compose(
             [
-                monai.transforms.SavitzkyGolaySmoothd(
-                    keys=include_series, window_length=9, order=1
-                ),
                 monai.transforms.OneOf(
                     transforms=[
-                        monai.transforms.RandGaussianNoised(
-                            keys=include_series, prob=1.0
-                        ),
-                        monai.transforms.RandBiasFieldd(
-                            keys=include_series, prob=1.0, coeff_range=(0.2, 0.3)
-                        ),
-                        monai.transforms.RandKSpaceSpikeNoised(
-                            keys=include_series, intensity_range=(11, 13), prob=1.0
-                        ),
-                        monai.transforms.Identityd(keys=include_series),
-                    ]
-                ),
-                monai.transforms.OneOf(
-                    transforms=[
-                        monai.transforms.SavitzkyGolaySmoothd(
-                            keys=include_series, window_length=3, order=1
-                        ),
                         monai.transforms.RandHistogramShiftd(
-                            keys=include_series, prob=1.0, num_control_points=(9, 11)
+                            keys="image",
+                            prob=0.5,
+                            num_control_points=(11, 15),
                         ),
-                        monai.transforms.RandGaussianSmoothd(
-                            keys=include_series, prob=1.0
-                        ),
-                        monai.transforms.Identityd(keys=include_series),
-                    ],
-                ),
-                monai.transforms.OneOf(
-                    transforms=[
-                        monai.transforms.Rand3DElasticd(
-                            keys=include_series,
-                            sigma_range=(5, 7),
-                            magnitude_range=(50, 350),
-                            prob=1.0,
-                        ),
-                        monai.transforms.RandAffineD(
-                            keys=include_series,
-                            shear_range=(0.0, 0.2),
-                            rotate_range=(0, 45, 0),
-                            prob=1.0,
-                        ),
-                        monai.transforms.Identityd(keys=include_series),
+                        noise_transform,
+                        smoothing_transform,
+                        spatial_transform,
+                        monai.transforms.Identityd(keys="image"),
                     ]
                 ),
                 monai.transforms.OneOf(
                     transforms=[
-                        monai.transforms.RandFlipd(keys=include_series),
-                        monai.transforms.RandAxisFlipd(keys=include_series),
+                        monai.transforms.RandFlipd(keys="image"),
+                        monai.transforms.RandAxisFlipd(keys="image"),
                     ],
                 ),
                 monai.transforms.RandRotated(
-                    keys=include_series, range_x=90, range_y=90, range_z=90
+                    keys="image", range_x=90, range_y=90, range_z=90
                 ),
             ]
         )
         self.global_transform_1 = monai.transforms.Compose(
             [
+                monai.transforms.SpatialPadd(
+                    keys="image",
+                    spatial_size=(
+                        global_crops_size,
+                        global_crops_size,
+                        global_crops_size,
+                    ),
+                    mode="reflect",
+                ),
                 monai.transforms.RandZoomd(
-                    keys=include_series,
+                    keys="image",
                     min_zoom=global_crops_scale[0],
                     max_zoom=global_crops_scale[1],
                 ),
                 monai.transforms.RandSpatialCropd(
-                    keys=include_series,
+                    keys="image",
                     roi_size=(global_crops_size, global_crops_size, global_crops_size),
                     random_size=False,
                 ),
@@ -859,19 +906,26 @@ class DataAugmentationDINO(object):
         )
         self.global_transform_2 = monai.transforms.Compose(
             [
+                monai.transforms.SpatialPadd(
+                    keys="image",
+                    spatial_size=(
+                        global_crops_size,
+                        global_crops_size,
+                        global_crops_size,
+                    ),
+                    mode="reflect",
+                ),
                 monai.transforms.RandZoomd(
-                    keys=include_series,
+                    keys="image",
                     min_zoom=global_crops_scale[0],
                     max_zoom=global_crops_scale[1],
                 ),
                 monai.transforms.RandSpatialCropd(
-                    keys=include_series,
+                    keys="image",
                     roi_size=(global_crops_size, global_crops_size, global_crops_size),
                     random_size=False,
                 ),
-                monai.transforms.RandShiftIntensityd(
-                    keys=include_series, offsets=(10, 20)
-                ),
+                monai.transforms.RandShiftIntensityd(keys="image", offsets=(10, 20)),
                 patch_level_transform,
             ]
         )
@@ -879,13 +933,22 @@ class DataAugmentationDINO(object):
         self.local_crops_number = local_crops_number
         self.local_transform = monai.transforms.Compose(
             [
+                monai.transforms.SpatialPadd(
+                    keys="image",
+                    spatial_size=(
+                        local_crops_size,
+                        local_crops_size,
+                        local_crops_size,
+                    ),
+                    mode="reflect",
+                ),
                 monai.transforms.RandZoomd(
-                    keys=include_series,
+                    keys="image",
                     min_zoom=local_crops_scale[0],
                     max_zoom=local_crops_scale[1],
                 ),
                 monai.transforms.RandSpatialCropd(
-                    keys=include_series,
+                    keys="image",
                     roi_size=(local_crops_size, local_crops_size, local_crops_size),
                     random_size=False,
                 ),
@@ -894,11 +957,14 @@ class DataAugmentationDINO(object):
         )
 
     def __call__(self, image):
+        # Return only the image-- we do not need the dict info in pretraining
+        # Also, the monai collate function can't deal with lists of crops
+        # And the pytorch collate function can't deal with dicts of lists
         crops = []
-        crops.append(self.global_transform_1(image))
-        crops.append(self.global_transform_2(image))
+        crops.append(self.global_transform_1(image)["image"])
+        crops.append(self.global_transform_2(image)["image"])
         for _ in range(self.local_crops_number):
-            crops.append(self.local_transform(image))
+            crops.append(self.local_transform(image)["image"])
         return crops
 
 

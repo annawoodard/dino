@@ -17,9 +17,8 @@ Misc functions.
 Mostly copy-paste from torchvision references or other public repos like DETR:
 https://github.com/facebookresearch/detr/blob/master/util/misc.py
 """
-import datetime
 import argparse
-import warnings
+import datetime
 import logging
 import math
 import os
@@ -28,11 +27,22 @@ import socket
 import subprocess
 import sys
 import time
+import warnings
 from collections import defaultdict, deque
+from functools import lru_cache
 from pathlib import Path
-from typing import Callable, Dict, Optional, Tuple, Union
-from torch.utils.data import DataLoader
-from tqdm import tqdm
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Hashable,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 
 import git
 import matplotlib.pyplot as plt
@@ -41,14 +51,110 @@ import pandas as pd
 import pydicom
 import torch
 import torch.distributed as dist
+from matplotlib.gridspec import SubplotSpec
+from monai.data import ShuffleBuffer
 from PIL import Image, ImageFilter, ImageOps
 from sklearn.model_selection import train_test_split
 from torch import nn
-from torchvision.utils import make_grid
-from functools import lru_cache
-from matplotlib.gridspec import SubplotSpec
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+from monai.transforms.transform import MapTransform
+from monai.config import KeysCollection
+from monai.utils.enums import TransformBackends
 
 logger = logging.getLogger()
+
+
+class TimeMIP(MapTransform):
+    """
+    Dictionary-based wrapper of :py:class:`monai.transforms.EnsureChannelFirst`.
+    """
+
+    backend = [TransformBackends.TORCH]
+
+    def __init__(
+        self,
+        keys: KeysCollection,
+        allow_missing_keys: bool = False,
+    ) -> None:
+        """
+        Args:
+            keys: keys of the corresponding items to be transformed.
+                See also: :py:class:`monai.transforms.compose.MapTransform`
+            allow_missing_keys: don't raise exception if key is missing.
+        """
+        super().__init__(keys, allow_missing_keys)
+
+    def __call__(
+        self, data: Mapping[Hashable, torch.Tensor]
+    ) -> Dict[Hashable, torch.Tensor]:
+        d = dict(data)
+        for key in self.key_iterator(d):
+            d[key] = torch.amax(d[key], 0).unsqueeze(0)
+        return d
+
+
+class DistributedShuffleBuffer(ShuffleBuffer):
+    """
+    Extend the IterableDataset with a buffer and randomly pop items.
+    Allow for DDP training
+
+    Args:
+        data: input data source to load and transform to generate dataset for model.
+        transform: a callable data transform on input data.
+        buffer_size: size of the buffer to store items and randomly pop, default to 512.
+        seed: random seed to initialize the random state of all workers, set `seed += 1` in
+            every iter() call, refer to the PyTorch idea:
+            https://github.com/pytorch/pytorch/blob/v1.10.0/torch/utils/data/distributed.py#L98.
+
+    Note:
+        Both ``monai.data.DataLoader`` and ``torch.utils.data.DataLoader`` do not seed this class (as a subclass of
+        ``IterableDataset``) at run time. ``persistent_workers=True`` flag (and pytorch>1.8) is therefore required
+        for multiple epochs of loading when ``num_workers>0``. For example::
+
+            import monai
+
+            def run():
+                dss = monai.data.ShuffleBuffer([1, 2, 3, 4], buffer_size=30, seed=42)
+
+                dataloader = monai.data.DataLoader(
+                    dss, batch_size=1, num_workers=2, persistent_workers=True)
+                for epoch in range(3):
+                    for item in dataloader:
+                        print(f"epoch: {epoch} item: {item}.")
+
+            if __name__ == '__main__':
+                run()
+
+    """
+
+    def __init__(
+        self, data, transform=None, buffer_size: int = 512, seed: int = 0
+    ) -> None:
+        self.source_dataset = data
+        self.total_length = len(data)
+        super().__init__(
+            data=data, transform=transform, buffer_size=buffer_size, seed=seed
+        )
+        self.shuffle_and_split_source_across_gpus()
+
+    def shuffle_and_split_source_across_gpus(self):
+        """Recommend to call this before every epoch"""
+        num_replicas = 1
+        rank = 1
+        if dist.is_available():
+            num_replicas = dist.get_world_size()
+            rank = dist.get_rank()
+        total_size = len(self.source_dataset) * num_replicas
+        g = torch.Generator()
+        g.manual_seed(self.seed)
+        indices = torch.randperm(len(self.source_dataset), generator=g).tolist()
+        # source dataset subset for this rank
+        indices = indices[rank:total_size:num_replicas]
+        self.data = self.source_dataset[indices]
+
+    def __len__(self):
+        return self.total_length
 
 
 def calculate_dataset_stats(dataset, num_workers=0):
@@ -62,6 +168,7 @@ def calculate_dataset_stats(dataset, num_workers=0):
     )
     means = []
     stds = []
+    print("calculating dataset stats...")
     for i, (image, _) in enumerate(tqdm(loader)):
         image = image * 1.0  # pytorch will not compute mean/std of integers
         means.append(torch.mean(image))
@@ -135,7 +242,6 @@ def write_example_dino_augs(
     num_examples=5,
     local_crops_number=8,
     three_dim=False,
-    series=None,
 ):
     patch_lists = []
     for i, entry in enumerate(dataset):
@@ -144,8 +250,8 @@ def write_example_dino_augs(
             break
     if three_dim:
         print("making mips...")
-        for i, _ in tqdm(enumerate(patch_lists)):
-            patch_lists[i] = [make_mip(p[series]) for p in patch_lists[i]]
+        for i, _ in tqdm(enumerate(patch_lists), total=num_examples):
+            patch_lists[i] = [make_mip(p) for p in patch_lists[i]]
     rc = {
         "axes.spines.left": False,
         "axes.spines.right": False,
@@ -171,6 +277,7 @@ def write_example_dino_augs(
     fig, axes = plt.subplots(
         num_examples, len(patch_lists[0]) + 1, figsize=(20, 2 * num_examples)
     )
+    print("plotting mips...")
     for i, patches in tqdm(enumerate(patch_lists)):
         for j, p in enumerate(patches[:2]):
             axes[i][j].imshow(
@@ -183,7 +290,7 @@ def write_example_dino_augs(
                 cmap="gray",
             )
     grid = plt.GridSpec(num_examples, len(patch_lists[0]) + 1)
-    create_subtitle(fig, grid[0, 0:1], "global views")
+    create_subtitle(fig, grid[0, 0:2], "global views")
     create_subtitle(fig, grid[0, 3:10], "local views")
     fig.tight_layout()
     plt.savefig(os.path.join(output_directory, "augmentation_examples.png"))
@@ -724,6 +831,7 @@ def setup_for_distributed(is_master):
 def init_distributed_mode(args):
     # launched with torch.distributed.launch
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        print("Running in local mode")
         args.rank = int(os.environ["RANK"])
         args.world_size = int(os.environ["WORLD_SIZE"])
         args.gpu = int(os.environ["LOCAL_RANK"])
@@ -741,6 +849,9 @@ def init_distributed_mode(args):
     elif torch.cuda.is_available():
         os.environ["MASTER_ADDR"] = "127.0.0.1"
         os.environ["MASTER_PORT"] = "29500"
+        args.rank = 0
+        args.world_size = 1
+        args.gpu = 0
     else:
         print("Does not support training without GPU.")
         sys.exit(1)
@@ -753,6 +864,10 @@ def init_distributed_mode(args):
     )
 
     torch.cuda.set_device(args.gpu)
+    for command in ["printenv", "nvidia-smi"]:
+        out = subprocess.Popen([command], stdout=subprocess.PIPE)
+        print(out.stdout.read().decode())
+
     print(
         "| distributed init (rank {}): {}".format(args.rank, args.dist_url), flush=True
     )
@@ -910,6 +1025,7 @@ class MultiCropWrapper(nn.Module):
             # accumulate outputs
             output = torch.cat((output, _out))
             start_idx = end_idx
+        result = self.head(output)
         # Run the head forward on the concatenated features.
         return self.head(output)
 
