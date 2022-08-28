@@ -27,7 +27,7 @@ def conv_bn(inp, oup, stride):
             inp, oup, kernel_size=3, stride=stride, padding=(1, 1, 1), bias=False
         ),
         nn.BatchNorm3d(oup),
-        nn.ReLU(inplace=True),
+        nn.ReLU(inplace=False),
     )
 
 
@@ -35,7 +35,7 @@ def conv_1x1x1_bn(inp, oup):
     return nn.Sequential(
         nn.Conv3d(inp, oup, 1, 1, 0, bias=False),
         nn.BatchNorm3d(oup),
-        nn.ReLU(inplace=True),
+        nn.ReLU(inplace=False),
     )
 
 
@@ -66,14 +66,14 @@ class InvertedResidual(nn.Module):
                 # pw
                 nn.Conv3d(oup_inc, oup_inc, 1, 1, 0, bias=False),
                 nn.BatchNorm3d(oup_inc),
-                nn.ReLU(inplace=True),
+                nn.ReLU(inplace=False),
                 # dw
                 nn.Conv3d(oup_inc, oup_inc, 3, stride, 1, groups=oup_inc, bias=False),
                 nn.BatchNorm3d(oup_inc),
                 # pw-linear
                 nn.Conv3d(oup_inc, oup_inc, 1, 1, 0, bias=False),
                 nn.BatchNorm3d(oup_inc),
-                nn.ReLU(inplace=True),
+                nn.ReLU(inplace=False),
             )
         else:
             self.banch1 = nn.Sequential(
@@ -83,21 +83,21 @@ class InvertedResidual(nn.Module):
                 # pw-linear
                 nn.Conv3d(inp, oup_inc, 1, 1, 0, bias=False),
                 nn.BatchNorm3d(oup_inc),
-                nn.ReLU(inplace=True),
+                nn.ReLU(inplace=False),
             )
 
             self.banch2 = nn.Sequential(
                 # pw
                 nn.Conv3d(inp, oup_inc, 1, 1, 0, bias=False),
                 nn.BatchNorm3d(oup_inc),
-                nn.ReLU(inplace=True),
+                nn.ReLU(inplace=False),
                 # dw
                 nn.Conv3d(oup_inc, oup_inc, 3, stride, 1, groups=oup_inc, bias=False),
                 nn.BatchNorm3d(oup_inc),
                 # pw-linear
                 nn.Conv3d(oup_inc, oup_inc, 1, 1, 0, bias=False),
                 nn.BatchNorm3d(oup_inc),
-                nn.ReLU(inplace=True),
+                nn.ReLU(inplace=False),
             )
 
     @staticmethod
